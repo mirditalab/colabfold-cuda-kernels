@@ -243,65 +243,6 @@ __device__ __forceinline__ const bf16* atom_mods(const AtomW& w, int b, int a) {
     return w.amods + (size_t(b) * c_kp.as + a) * kAtomModSlots * kAtomC;
 }
 
-// AX = norm(qa)·am0 + am1; AXK = norm(qa or bf16(AX))·am2 + am3
-__device__ void atom_adaln(Deal& d, const AtomW& w, int b) {
-    const int rows = c_kp.S * c_kp.A;
-    for (int r = row_first(d); r < rows; r += row_step()) {
-        const bf16* am = atom_mods(w, b, r % c_kp.A);
-        Row x = load_row(c_kp.buf.qa + size_t(r) * kAtomC, kAtomC);
-        atom_norm(x);
-        Row xq = affine(x, am + AM_Q_SCALE * kAtomC, am + AM_Q_BIAS * kAtomC);
-        store_row_bf(c_kp.buf.ax + size_t(r) * kAtomC, xq);
-        if (c_kp.flags & CHAIN_K) {
-            x = load_row_bf(c_kp.buf.ax + size_t(r) * kAtomC, kAtomC);
-            atom_norm(x);
-        }
-        store_row_bf(c_kp.buf.axk + size_t(r) * kAtomC,
-                     affine(x, am + AM_K_SCALE * kAtomC, am + AM_K_BIAS * kAtomC));
-    }
-    row_done(d, rows);
-}
-
-// QKNORM: LayerNorm of q and of k over their 128 channels; ESM: per-head RMSNorm and rotary
-__device__ void atom_qknorm(Deal& d, const AtomW& w, int b) {
-    const int rows = c_kp.S * c_kp.A;
-    for (int r = row_first(d); r < 2 * rows; r += row_step()) {
-        const bool is_k = r >= rows;
-        const int row = r - (is_k ? rows : 0);
-        bf16* p = (is_k ? c_kp.buf.akv : c_kp.buf.aqg) + size_t(row) * 2 * kAtomC;
-        Row x = load_row_bf(p, kAtomC);
-        if (c_kp.flags & QKNORM) {
-            const float* qkn =
-                w.qkn + (b * kQkNormRows + (is_k ? QKN_K_SCALE : QKN_Q_SCALE)) * kAtomC;
-            layernorm(x, kLnEps);
-            x = affine(x, qkn, qkn + kAtomC);
-        } else {
-            // a head is 8 lanes of 4 channels
-            float4& v = x.v[0];
-            float q = sum4(mul4(v, v));
-            for (int o = 1; o < kAtomHeadD / 4; o *= 2) {
-                q += __shfl_xor(q, o, kWarp);
-            }
-            const float inv = 1.f / sqrtf(q / kAtomHeadD + FLT_EPSILON);
-            v = make_float4(v.x * inv, v.y * inv, v.z * inv, v.w * inv);
-            constexpr int kHalf = kAtomHeadD / 2;
-            const int d0 = 4 * lane_id() % kAtomHeadD;
-            const float* rope = c_kp.geo.rope + size_t(row % c_kp.A) * kAtomHeadD + d0 % kHalf;
-            const float4 cs = ld4(rope), sn = ld4(rope + kHalf);
-            const int partner = kHalf / 4; // the lane holding channel d ± 16
-            float4 o =
-                make_float4(__shfl_xor(v.x, partner, kWarp), __shfl_xor(v.y, partner, kWarp),
-                            __shfl_xor(v.z, partner, kWarp), __shfl_xor(v.w, partner, kWarp));
-            if (d0 < kHalf) {
-                o = make_float4(-o.x, -o.y, -o.z, -o.w);
-            }
-            v = add4(mul4(v, cs), mul4(o, sn));
-        }
-        store_row_bf(p, x);
-    }
-    row_done(d, 2 * rows);
-}
-
 // skip = qa·QMASK, kept in f32 and as bf16 for the aggregation GEMM
 __device__ void atom_skip(Deal& d) {
     const int rows = c_kp.S * c_kp.A;

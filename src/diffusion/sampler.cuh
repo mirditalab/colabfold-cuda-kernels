@@ -12,8 +12,8 @@
 
 namespace mk {
 
-// CCK_TIMING phase kinds in the harness's order (mk.py KINDS); A_O and A_W2 stay empty, as the
-// fused MLP (A_GLU) does the reference's three unfused phases
+// CCK_TIMING phase kinds in the harness's order (mk.py KINDS); A_ADALN, A_O and A_W2 stay empty:
+// the fused passes A_QKV and A_GLU do the reference's separate phases
 // clang-format off
 #define MK_KINDS(X)                                                                                \
     X(AUG) X(SC) X(SC_GEMM) X(MODS) X(ATOM_INIT) X(A_ADALN) X(A_QKV) X(A_ATTN) X(A_O) X(A_GLU)      \
@@ -81,21 +81,11 @@ __device__ __forceinline__ bool resident_pairs() {
     return c_kp.plg >= c_kp.nb;
 }
 
-__device__ Deal atom_qknorm_phase(Run& r, Deal d, const AtomW& w, int b) {
-    if (!(c_kp.flags & (QKNORM | ESM))) {
-        return d;
-    }
-    atom_qknorm(d, w, b);
-    return next(r, K_QKN);
-}
-
-// adaLN | [q|g], [k|v] | (q/k norm) | attention | fused MLP
-__device__ void atom_block(Run& r, const AtomW& w, const Gemm (&g)[kAtomBlocks][2], int b) {
+// fused adaLN, projections and q/k norms | attention | fused MLP
+__device__ void atom_block(Run& r, const AtomW& w, int b) {
     Deal d = deal(r);
-    atom_adaln(d, w, b);
-    d = next(r, K_A_ADALN);
-    run_gemms(d, {&g[b][0], &g[b][1]});
-    d = atom_qknorm_phase(r, next(r, K_A_QKV), w, b);
+    atom_proj(d, w, b);
+    d = next(r, K_A_QKV);
     atom_attention(d, w, b);
     d = next(r, K_A_ATTN);
     atom_mlp(d, w, b);
@@ -143,36 +133,33 @@ __device__ void token_block(Run& r, int b) {
 __device__ void denoise(Run& r, float t) {
     const GemmTable& g = gemms();
     const AtomW& enc = c_kp.enc;
-    // the single conditioning, overlapped with encoder blocks 0-1
+    // the single conditioning, overlapped with the encoder
     Deal d = deal(r);
     noise_vector(d, t);
     atom_init(d, t);
     d = next(r, K_ATOM_INIT);
-    sc_layernorm(d, 0, true);
-    atom_adaln(d, enc, 0);
-    d = next(r, K_A_ADALN);
-    run_gemms(d, {&g.st_w1[0], &g.enc[0][0], &g.enc[0][1]});
-    d = atom_qknorm_phase(r, next(r, K_A_QKV), enc, 0);
-    run_gemms(d, {&g.st_w2[0]});
-    atom_attention(d, enc, 0);
-    d = next(r, K_A_ATTN);
-    sc_layernorm(d, 1, false);
-    atom_mlp(d, enc, 0);
-    d = next(r, K_A_GLU);
-    run_gemms(d, {&g.st_w1[1]});
-    atom_adaln(d, enc, 1);
-    d = next(r, K_A_ADALN);
-    run_gemms(d, {&g.st_w2[1], &g.enc[1][0], &g.enc[1][1]});
-    d = atom_qknorm_phase(r, next(r, K_A_QKV), enc, 1);
-    sc_prep(d);
-    atom_attention(d, enc, 1);
-    d = next(r, K_A_ATTN);
-    run_gemms(d, {&g.mods1, &g.mods2, &g.embed});
-    atom_mlp(d, enc, 1);
-    next(r, K_MODS);
-    atom_block(r, enc, g.enc, 2);
+    for (int b = 0; b < kAtomBlocks; b++) {
+        if (b < 2) {
+            sc_layernorm(d, b, b == 0);
+        } else {
+            sc_prep(d);
+        }
+        atom_proj(d, enc, b);
+        d = next(r, K_A_QKV);
+        if (b < 2) {
+            run_gemms(d, {&g.st_w1[b]});
+        } else {
+            run_gemms(d, {&g.mods1, &g.mods2, &g.embed});
+        }
+        atom_attention(d, enc, b);
+        d = next(r, b < 2 ? K_A_ATTN : K_MODS);
+        if (b < 2) {
+            run_gemms(d, {&g.st_w2[b]});
+        }
+        atom_mlp(d, enc, b);
+        d = next(r, K_A_GLU);
+    }
     // atoms to tokens, the token transformer, tokens back to atoms
-    d = deal(r);
     atom_skip(d);
     d = next(r, K_AGG);
     run_gemms(d, {&g.aggr});
@@ -188,7 +175,7 @@ __device__ void denoise(Run& r, float t) {
     decoder_init(d);
     next(r, K_DEC_GLUE);
     for (int b = 0; b < kAtomBlocks; b++) {
-        atom_block(r, c_kp.dec, g.dec, b);
+        atom_block(r, c_kp.dec, b);
     }
     d = deal(r);
     atom_update(d);

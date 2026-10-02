@@ -98,7 +98,7 @@ static Template make_template(int S, int Nb, int NSb, int nsteps, uint32_t flags
     shape[B_MODS] = {kTokC, kBf16, size_t(t.nb) * kTokModSlots * Nb};
     shape[B_SE] = {kTokC, kF32, nb};
     shape[B_QA] = shape[B_SKIP] = {kAtomC, kF32, ra};
-    shape[B_AX] = shape[B_AXK] = shape[B_AO] = shape[B_ABF] = {kAtomC, kBf16, ra};
+    shape[B_AO] = shape[B_ABF] = {kAtomC, kBf16, ra};
     shape[B_AQG] = shape[B_AKV] = {2 * kAtomC, kBf16, ra};
     shape[B_ACT] = {kTokC, kF32, rt};
     shape[B_TX] = shape[B_TO] = {kTokC, kBf16, rt};
@@ -185,19 +185,6 @@ __device__ void build_gemms(const KP& p, GemmTable& t, int grid) {
                              kTokHidden, EPI_RESID, b.act, kTokC);
         g[TG_W2].gate = mods + size_t(TM_TRANS_GATE) * N * kTokC, g[TG_W2].period = N;
         g[TG_W2].rowmask = w.tmask;
-    }
-    for (int side = 0; side < 2; side++) {
-        const AtomW& aw = side ? p.dec : p.enc;
-        Gemm(*g)[2] = side ? t.dec : t.enc;
-        for (int k = 0; k < kAtomBlocks; k++) {
-            const size_t wo = size_t(k) * 2 * kAtomC * kAtomC;
-            g[k][0] = make_gemm(b.ax, kAtomC, aw.wqg + wo, ra, 2 * kAtomC, kAtomC, EPI_QKVG, b.aqg,
-                                2 * kAtomC);
-            g[k][0].bias = aw.bq + k * kAtomC, g[k][0].bias_cols = kAtomC,
-            g[k][0].sig_from = kAtomC;
-            g[k][1] = make_gemm(b.axk, kAtomC, aw.wkv + wo, ra, 2 * kAtomC, kAtomC, EPI_STORE,
-                                b.akv, 2 * kAtomC);
-        }
     }
     for (int grp = 0; grp * p.plg < p.nb; grp++) {
         const int b0 = grp * p.plg, n = kPairHeads * min(p.plg, p.nb - b0);
@@ -343,7 +330,7 @@ static KP make_kp(const Template& t, const void* const* in, char* ws, float* out
     b.se = sp.f(B_SE), b.qa = sp.f(B_QA), b.skip = sp.f(B_SKIP), b.act = sp.f(B_ACT);
     b.tb = sp.f(B_TB), b.upd = sp.f(B_UPD);
     b.sct = sp.h(B_SCT), b.scln0 = sp.h(B_SCLN0), b.scbf = sp.h(B_SCBF), b.sch = sp.h(B_SCH);
-    b.mods = sp.h(B_MODS), b.ax = sp.h(B_AX), b.axk = sp.h(B_AXK), b.ao = sp.h(B_AO);
+    b.mods = sp.h(B_MODS), b.ao = sp.h(B_AO);
     b.abf = sp.h(B_ABF), b.aqg = sp.h(B_AQG), b.akv = sp.h(B_AKV), b.tx = sp.h(B_TX);
     b.tx2 = sp.h(B_TX2), b.qkvg = sp.h(B_QKVG), b.to = sp.h(B_TO), b.tc = sp.h(B_TC);
     b.plg = sp.h(B_PLG);

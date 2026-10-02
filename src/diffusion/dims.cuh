@@ -79,8 +79,8 @@ constexpr int kAtomInputs = DEC_AMODS - ENC_AMODS;
 // clang-format off
 #define MK_BUFFERS(X)                                                                              \
     X(POS) X(XN) X(OUT) X(GRAD) X(CEN) X(KAB) X(NTV) X(SC) X(SCT) X(SCLN0) X(SCBF) X(SCH) X(MODS)   \
-    X(SE) X(QA) X(SKIP) X(AX) X(AXK) X(AO) X(ABF) X(AQG) X(AKV) X(ACT) X(TX) X(TX2) X(QKVG) X(TO)  \
-    X(TC) X(TB) X(UPD) X(PLG)
+    X(SE) X(QA) X(SKIP) X(AO) X(ABF) X(AQG) X(AKV) X(ACT) X(TX) X(TX2) X(QKVG) X(TO) X(TC) X(TB)   \
+    X(UPD) X(PLG)
 // clang-format on
 #define MK_ENUM(name) B_##name,
 enum Buf { MK_BUFFERS(MK_ENUM) kNumBufs };

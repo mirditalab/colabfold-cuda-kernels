@@ -48,9 +48,8 @@ struct Gemm {
 
 struct GemmTable {
     Gemm st_w1[2], st_w2[2], mods1, mods2, embed, aggr, broadcast;
-    Gemm tok[kNbMax][4];                           // QKVG, WO, W1, W2
-    Gemm enc[kAtomBlocks][2], dec[kAtomBlocks][2]; // [q|g], [k|v]
-    Gemm pair[kNbMax];                             // one per ring group
+    Gemm tok[kNbMax][4]; // QKVG, WO, W1, W2
+    Gemm pair[kNbMax];   // one per ring group
 };
 enum TokGemm { TG_QKVG, TG_WO, TG_W1, TG_W2 };
 
@@ -75,8 +74,7 @@ struct Geo {
 
 struct Bufs {
     float *pos, *xn, *out, *grad, *cen, *kab, *ntv, *sc, *se, *qa, *skip, *act, *tb, *upd;
-    bf16 *sct, *scln0, *scbf, *sch, *mods, *ax, *axk, *ao, *abf, *aqg, *akv, *tx, *tx2, *qkvg, *to,
-        *tc, *plg;
+    bf16 *sct, *scln0, *scbf, *sch, *mods, *ao, *abf, *aqg, *akv, *tx, *tx2, *qkvg, *to, *tc, *plg;
 };
 
 struct KP {
