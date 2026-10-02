@@ -88,7 +88,6 @@ struct KP {
     uint32_t flags;
     float ln_eps, atom_eps;
     int plg;      // pair-logit tables in the ring
-    int attn_mi;  // token attention query tiles per warp
     float t;      // mode 1: the noise level
     int dbg_stop; // stop after this many phases (0: never)
     TokenW tw;

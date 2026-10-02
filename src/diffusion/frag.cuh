@@ -11,6 +11,7 @@
 #include <cute/arch/copy_sm75.hpp>
 #include <cute/arch/copy_sm80.hpp>
 #include <cute/arch/mma_sm80.hpp>
+#include <cuda_bf16.h>
 #endif
 
 namespace mk {
@@ -134,12 +135,14 @@ __device__ __forceinline__ void mma(Acc& d, const FragA& a, const FragB& b) {
             d.v[5], d.v[6], d.v[7]);
 }
 
-// an accumulator as the A operand of the next product over its columns: a register repack
+// an accumulator as the A operand of the next product over its columns: a register repack, with one
+// cvt per pair (the same rounding as to_bf, at a fifth of the instructions)
 __device__ __forceinline__ FragA acc_to_a(const Acc& c) {
     FragA f;
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-        f.r[j] = pack_bf2(c.v[2 * j], c.v[2 * j + 1]);
+        const __nv_bfloat162 h = __floats2bfloat162_rn(c.v[2 * j], c.v[2 * j + 1]);
+        f.r[j] = *reinterpret_cast<const uint32_t*>(&h);
     }
     return f;
 }

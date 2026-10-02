@@ -235,16 +235,6 @@ __global__ void mk_configure(KP p, const int* ext, char* ws, size_t table_off, s
         p.np = pad_keys(p.N);
         p.chunks = cdiv(p.N * kSlots, kChunk);
         p.plg = int(min(size_t(p.nb), plg_bytes / pair_table_bytes(p.np)));
-        // token attention: query tiles per warp, the fewer whole rounds
-        int best = 1, best_cost = INT_MAX;
-        for (int mi = 1; mi <= 2; mi++) {
-            const int items = kHeads * p.S * cdiv(p.N, kWarps * kMma * mi);
-            const int cost = cdiv(items, grid) * mi;
-            if (cost < best_cost) {
-                best = mi, best_cost = cost;
-            }
-        }
-        p.attn_mi = best;
         GemmTable* t = reinterpret_cast<GemmTable*>(ws + table_off);
         p.gemms = t;
         build_gemms(p, *t, grid);
