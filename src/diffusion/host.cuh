@@ -235,6 +235,7 @@ __global__ void mk_configure(KP p, const int* ext, char* ws, size_t table_off, s
         p.np = pad_keys(p.N);
         p.chunks = cdiv(p.N * kSlots, kChunk);
         p.plg = int(min(size_t(p.nb), plg_bytes / pair_table_bytes(p.np)));
+        p.attn_wide = token_attention_wide(p.S, p.N, grid);
         GemmTable* t = reinterpret_cast<GemmTable*>(ws + table_off);
         p.gemms = t;
         build_gemms(p, *t, grid);

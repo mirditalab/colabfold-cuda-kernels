@@ -93,120 +93,181 @@ __device__ __forceinline__ void bias_tile(const bf16* tile, float (&v)[kAccVals]
 }
 
 // ---- token
-constexpr int kTokKeys = kKeyPad;        // keys per staged chunk
 constexpr int kTokLd = kHeadD + kLdsPad; // smem row: conflict-free ldmatrix
 constexpr int kTokDT = kHeadD / kMma;    // head-dim tiles
-constexpr int kTokKT = kTokKeys / kMma;  // key tiles per chunk
-constexpr int kTokKV = kTokKeys * kTokLd;
-constexpr int kTokBias = kWarps * kTokKT * kTileVals; // each warp's bias tiles of one chunk
-constexpr int kTokStage = 2 * kTokKV + kTokBias;
-constexpr size_t kTokAttnSmem = 2 * kTokStage * sizeof(bf16);
+
+// MI query tiles per warp, KT key tiles per staged chunk, STAGES chunks in flight
+template <int MI, int KT, int STAGES> struct TokAttn {
+    static constexpr int kMI = MI, kKT = KT, kStages = STAGES;
+    static constexpr int kKeys = KT * kMma;
+    static constexpr int kKV = kKeys * kTokLd;
+    static constexpr int kBias = MI * KT * kTileVals; // one warp's pair-logit tiles of a chunk
+    static constexpr int kStage = 2 * kKV + kWarps * kBias;
+    static constexpr int kQueries = kWarps * MI * kMma; // per item
+    static constexpr size_t kSmem = STAGES * kStage * sizeof(bf16);
+    static_assert(kKeyPad % kKeys == 0, "chunks tile the padded keys");
+};
 
 // keys k0.. into one stage: K and V of the head (zero past the real tokens), and each warp's
-// pair-logit tiles, which come from DRAM and would otherwise stall the chunk
-__device__ __forceinline__ void stage_token_chunk(bf16* st, const bf16* rows, const bf16* bias,
-                                                  int k0) {
+// pair-logit tiles from row tile qt on (zero past the table)
+template <class T>
+__device__ __forceinline__ void stage_token_chunk(bf16* st, const bf16* rows, const bf16* plg,
+                                                  int k0, int qt) {
     constexpr int kPieces = kHeadD / 8;
-    for (int i = threadIdx.x; i < kTokKeys * kPieces; i += kThreads) {
+    for (int i = threadIdx.x; i < T::kKeys * kPieces; i += kThreads) {
         const int j = i / kPieces, p = i % kPieces, key = k0 + j;
         const bool ok = key < c_kp.N;
         const bf16* src = rows + size_t(ok ? key : 0) * kQKVG + p * 8;
         async_copy16(st + j * kTokLd + p * 8, src + kTokC, ok);
-        async_copy16(st + kTokKV + j * kTokLd + p * 8, src + 2 * kTokC, ok);
+        async_copy16(st + T::kKV + j * kTokLd + p * 8, src + 2 * kTokC, ok);
     }
-    bf16* bs = st + 2 * kTokKV + warp_id() * kTokKT * kTileVals;
-    for (int i = lane_id(); i < kTokKT * kTileVals / 8; i += kWarp) {
-        async_copy16(bs + i * 8, bias + i * 8, true);
+    const int tiles = c_kp.np / kMma;
+    constexpr int kRow = T::kKT * kTileVals; // a tile row's KT tiles are contiguous
+    bf16* bs = st + 2 * T::kKV + warp_id() * T::kBias;
+    for (int i = lane_id() * 8; i < T::kBias; i += kWarp * 8) {
+        const int mi = i / kRow;
+        const bool ok = qt + mi < tiles;
+        const bf16* src = plg + (size_t(ok ? qt + mi : 0) * tiles + k0 / kMma) * kTileVals;
+        async_copy16(bs + i, src + i % kRow, ok);
     }
 }
 
-// item (head, 64-query block, sample): each warp owns 16 queries
+// item (head, query block, sample): each warp owns 16·MI queries
+template <class T>
 __device__ __noinline__ void token_attention_item(int slot, int h, int qb, int s) {
+    constexpr int MI = T::kMI, KT = T::kKT, STAGES = T::kStages;
     bf16* sm = reinterpret_cast<bf16*>(smem_base());
     const int N = c_kp.N, np = c_kp.np, tiles = np / kMma;
-    const int q0 = (qb * kWarps + warp_id()) * kMma;
+    const int q0 = qb * T::kQueries + warp_id() * MI * kMma;
     const bf16* rows = c_kp.buf.qkvg + size_t(s) * N * kQKVG + h * kHeadD;
-    const bf16* bias =
-        c_kp.buf.plg + ((size_t(slot) * kHeads + h) * tiles + q0 / kMma) * tiles * kTileVals;
+    const bf16* plg = c_kp.buf.plg + (size_t(slot) * kHeads + h) * tiles * tiles * kTileVals;
     const float scale = kLog2e / sqrtf(float(kHeadD));
 
-    FragA fq[kTokDT];
+    FragA fq[MI][kTokDT];
+    Acc o[MI][kTokDT];
 #pragma unroll
-    for (int kd = 0; kd < kTokDT; kd++) {
-        load_a(fq[kd], rows + size_t(q0) * kQKVG + kd * kMma, kQKVG);
-    }
-    Acc o[1][kTokDT];
+    for (int mi = 0; mi < MI; mi++) {
 #pragma unroll
-    for (int dt = 0; dt < kTokDT; dt++) {
-        acc_zero(o[0][dt]);
+        for (int kd = 0; kd < kTokDT; kd++) {
+            load_a(fq[mi][kd], rows + size_t(q0 + mi * kMma) * kQKVG + kd * kMma, kQKVG);
+            acc_zero(o[mi][kd]);
+        }
     }
-    Softmax<1> sm_state;
+    Softmax<MI> sm_state;
     sm_state.init();
 
-    const int chunks = np / kTokKeys;
-    stage_token_chunk(sm, rows, bias, 0);
-    async_commit();
+    const int chunks = np / T::kKeys;
+    for (int c = 0; c < STAGES - 1; c++) {
+        stage_token_chunk<T>(sm + c * T::kStage, rows, plg, c * T::kKeys, q0 / kMma);
+        async_commit();
+    }
 #pragma unroll 1
     for (int c = 0; c < chunks; c++) {
-        const bf16* st = sm + (c % 2) * kTokStage;
-        // one barrier per chunk: chunk c has landed and every warp is done with chunk c - 1
-        async_wait<0>();
+        // one barrier per chunk: chunk c has landed and every warp is done with the slot refilled
+        async_wait<STAGES - 2>();
         __syncthreads();
-        if (c + 1 < chunks) {
-            stage_token_chunk(sm + (c + 1) % 2 * kTokStage, rows,
-                              bias + (c + 1) * kTokKT * kTileVals, (c + 1) * kTokKeys);
+        if (c + STAGES - 1 < chunks) {
+            stage_token_chunk<T>(sm + (c + STAGES - 1) % STAGES * T::kStage, rows, plg,
+                                 (c + STAGES - 1) * T::kKeys, q0 / kMma);
         }
         async_commit();
-        const bf16* bs = st + 2 * kTokKV + warp_id() * kTokKT * kTileVals;
-        Acc sc[kTokKT];
+        const bf16* st = sm + c % STAGES * T::kStage;
+        const bf16* bs = st + 2 * T::kKV + warp_id() * T::kBias;
+        Acc sc[MI][KT];
 #pragma unroll
-        for (int kt = 0; kt < kTokKT; kt++) {
-            acc_zero(sc[kt]);
+        for (int kt = 0; kt < KT; kt++) {
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++) {
+                acc_zero(sc[mi][kt]);
+            }
 #pragma unroll
             for (int kd = 0; kd < kTokDT; kd++) {
                 FragB fk;
                 load_b_lds(fk, st + kt * kMma * kTokLd + kd * kMma, kTokLd);
-                mma(sc[kt], fq[kd], fk);
-            }
-            float b[kAccVals];
-            bias_tile(bs + kt * kTileVals, b);
 #pragma unroll
-            for (int i = 0; i < kAccVals; i++) {
-                sc[kt].v[i] = sc[kt].v[i] * scale + b[i];
+                for (int mi = 0; mi < MI; mi++) {
+                    mma(sc[mi][kt], fq[mi][kd], fk);
+                }
             }
         }
-        sm_state.step(0, sc, o[0]);
 #pragma unroll
-        for (int kt = 0; kt < kTokKT; kt++) {
-            const FragA p = acc_to_a(sc[kt]);
+        for (int mi = 0; mi < MI; mi++) {
+#pragma unroll
+            for (int kt = 0; kt < KT; kt++) {
+                float b[kAccVals];
+                bias_tile(bs + (mi * KT + kt) * kTileVals, b);
+#pragma unroll
+                for (int i = 0; i < kAccVals; i++) {
+                    sc[mi][kt].v[i] = sc[mi][kt].v[i] * scale + b[i];
+                }
+            }
+            sm_state.step(mi, sc[mi], o[mi]);
+        }
+#pragma unroll
+        for (int kt = 0; kt < KT; kt++) {
+            FragA p[MI];
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++) {
+                p[mi] = acc_to_a(sc[mi][kt]);
+            }
 #pragma unroll
             for (int dt = 0; dt < kTokDT; dt++) {
                 FragB fv;
-                load_b_lds_t(fv, st + kTokKV + kt * kMma * kTokLd + dt * kMma, kTokLd);
-                mma(o[0][dt], p, fv);
+                load_b_lds_t(fv, st + T::kKV + kt * kMma * kTokLd + dt * kMma, kTokLd);
+#pragma unroll
+                for (int mi = 0; mi < MI; mi++) {
+                    mma(o[mi][dt], p[mi], fv);
+                }
             }
         }
     }
-    __syncthreads(); // the next item restages the first buffer
+    __syncthreads(); // the next item restages from the first slot
     sm_state.finish();
-    const size_t row = size_t(s) * N + q0;
 #pragma unroll
-    for (int dt = 0; dt < kTokDT; dt++) {
-        const int col = h * kHeadD + dt * kMma;
-        store_gated(o[0][dt], sm_state.l[0], c_kp.buf.to + row * kTokC + col, kTokC,
-                    c_kp.buf.qkvg + row * kQKVG + 3 * kTokC + col, kQKVG, N - q0);
+    for (int mi = 0; mi < MI; mi++) {
+        const int q = q0 + mi * kMma;
+        const size_t row = size_t(s) * N + q;
+#pragma unroll
+        for (int dt = 0; dt < kTokDT; dt++) {
+            const int col = h * kHeadD + dt * kMma;
+            store_gated(o[mi][dt], sm_state.l[mi], c_kp.buf.to + row * kTokC + col, kTokC,
+                        c_kp.buf.qkvg + row * kQKVG + 3 * kTokC + col, kQKVG, N - q);
+        }
     }
+}
+
+template <class T> __device__ void token_attention_items(Deal& d, int b) {
+    // samples fastest: they run side by side and share each pair-logit tile through L2
+    const int S = c_kp.S, qblocks = cdiv(c_kp.N, T::kQueries);
+    const int items = kHeads * qblocks * S;
+    for (int it = d.first(); it < items; it += gridDim.x) {
+        token_attention_item<T>(b % c_kp.plg, it / S % kHeads, it / (S * kHeads), it % S);
+    }
+    d.advance(items);
+}
+
+// one query tile per warp for small structures (more items to spread), three when there are rounds
+// to spare: K/V staged once serve three tiles, which made the dimer's attention 18% faster
+using TokAttnNarrow = TokAttn<1, 4, 2>;
+using TokAttnWide = TokAttn<3, 2, 2>;
+constexpr size_t kTokAttnSmem =
+    TokAttnNarrow::kSmem > TokAttnWide::kSmem ? TokAttnNarrow::kSmem : TokAttnWide::kSmem;
+constexpr float kWideItemCost = 2.5f; // a wide item's time in narrow items, measured on the dimer
+
+// the wide shape when its whole rounds over the grid cost no more
+__host__ __device__ inline bool token_attention_wide(int S, int N, int grid) {
+    const int narrow = kHeads * S * cdiv(N, TokAttnNarrow::kQueries);
+    const int wide = kHeads * S * cdiv(N, TokAttnWide::kQueries);
+    return cdiv(wide, grid) * kWideItemCost <= cdiv(narrow, grid);
 }
 
 // TO = softmax(q kᵀ/√48 + L_b) v · g over the items (head, query block, sample)
 __device__ void token_attention(Deal& d, int b) {
-    const int qblocks = cdiv(c_kp.N, kWarps * kMma);
-    const int items = kHeads * qblocks * c_kp.S;
-    for (int it = d.first(); it < items; it += gridDim.x) {
-        token_attention_item(b % c_kp.plg, it % kHeads, it / kHeads % qblocks,
-                             it / (kHeads * qblocks));
+    if (c_kp.attn_wide) {
+        token_attention_items<TokAttnWide>(d, b);
+    } else {
+        token_attention_items<TokAttnNarrow>(d, b);
     }
-    d.advance(items);
 }
 
 // ---- atom

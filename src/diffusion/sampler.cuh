@@ -169,7 +169,7 @@ __device__ void denoise(Run& r, float t) {
     d = next(r, K_A_ATTN);
     run_gemms(d, {&g.mods1, &g.mods2, &g.embed});
     atom_mlp(d, enc, 1);
-    next(r, K_A_GLU);
+    next(r, K_MODS);
     atom_block(r, enc, g.enc, 2);
     // atoms to tokens, the token transformer, tokens back to atoms
     d = deal(r);
