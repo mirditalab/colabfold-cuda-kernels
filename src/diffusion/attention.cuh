@@ -69,13 +69,17 @@ template <int R> struct Softmax {
 __device__ __forceinline__ void store_gated(const Acc& o, const float (&l)[kRowSlots], bf16* out,
                                             int ldo, const bf16* gate, int ldg, int rows_left) {
 #pragma unroll
-    for (int i = 0; i < kAccVals; i += 2) {
+    for (int i = 0; i < kAccVals; i += kAdj) {
         const int r = acc_row(i), c = acc_col(i);
         if (r < rows_left) {
-            const uint32_t g = ld32(gate + size_t(r) * ldg + c);
+            const Adj<bf16> g = adj(gate + size_t(r) * ldg + c);
             const float inv = 1.f / l[row_slot(i)];
-            *reinterpret_cast<uint32_t*>(out + size_t(r) * ldo + c) =
-                pack_bf2(o.v[i] * inv * from_bf(g & 0xFFFFu), o.v[i + 1] * inv * from_bf(g >> 16));
+            Adj<bf16> v;
+#pragma unroll
+            for (int j = 0; j < kAdj; j++) {
+                v.v[j] = bf16(to_bf(o.v[i + j] * inv * from_bf(g.v[j])));
+            }
+            adj(out + size_t(r) * ldo + c) = v;
         }
     }
 }
@@ -102,7 +106,8 @@ template <int MI, int KT, int STAGES> struct TokAttn {
     static constexpr int kBias = MI * KT * kTileVals; // one warp's pair-logit tiles of a chunk
     static constexpr int kStage = 2 * kKV + kWarps * kBias;
     static constexpr int kQueries = kWarps * MI * kMma; // per item
-    static constexpr size_t kSmem = STAGES * kStage * sizeof(bf16);
+    static constexpr int kTiles = STAGES * kStage;      // the warps' acc_to_a tiles follow
+    static constexpr size_t kSmem = (kTiles + kWarps * kAccTile) * sizeof(bf16);
     static_assert(kKeyPad % kKeys == 0, "chunks tile the padded keys");
 };
 
@@ -169,6 +174,9 @@ __device__ __noinline__ void token_attention_item(int slot, int h, int qb, int s
                                  (c + STAGES - 1) * T::kKeys, q0 / kMma);
         }
         async_commit();
+        if (STAGES == 1) { // the one stage was refilled just now, synchronously
+            __syncthreads();
+        }
         const bf16* st = sm + c % STAGES * T::kStage;
         const bf16* bs = st + 2 * T::kKV + warp_id() * T::kBias;
         Acc sc[MI][KT];
@@ -206,7 +214,7 @@ __device__ __noinline__ void token_attention_item(int slot, int h, int qb, int s
             FragA p[MI];
 #pragma unroll
             for (int mi = 0; mi < MI; mi++) {
-                p[mi] = acc_to_a(sc[mi][kt]);
+                p[mi] = acc_to_a(sc[mi][kt], sm + T::kTiles + warp_id() * kAccTile);
             }
 #pragma unroll
             for (int dt = 0; dt < kTokDT; dt++) {
@@ -246,8 +254,13 @@ template <class T> __device__ void token_attention_items(Deal& d, int b) {
 
 // one query tile per warp for small structures (more items to spread), three when there are rounds
 // to spare: K/V staged once serve three tiles, which made the dimer's attention 18% faster
-using TokAttnNarrow = TokAttn<1, 4, 2>;
-using TokAttnWide = TokAttn<3, 2, 2>;
+#if CCK_AMD
+using TokAttnNarrow = TokAttn<1, 2, kCopyStages>; // shapes within 16 KB of shared memory
+using TokAttnWide = TokAttn<2, 2, kCopyStages>;
+#else
+using TokAttnNarrow = TokAttn<1, 4, kCopyStages>;
+using TokAttnWide = TokAttn<3, 2, kCopyStages>;
+#endif
 constexpr size_t kTokAttnSmem =
     TokAttnNarrow::kSmem > TokAttnWide::kSmem ? TokAttnNarrow::kSmem : TokAttnWide::kSmem;
 constexpr float kWideItemCost = 2.5f; // a wide item's time in narrow items, measured on the dimer
@@ -275,7 +288,7 @@ constexpr int kAtomDT = kAtomHeadD / kMma;
 constexpr int kAtomKeyT = kAtomKeys / kMma;
 constexpr int kAtomQT = kSubset / kMma;
 constexpr int kAtomStage = kAtomKeys * kAtomLd;
-constexpr size_t kAtomAttnSmem = kWarps * 2 * 2 * kAtomStage * sizeof(bf16);
+constexpr size_t kAtomAttnSmem = kWarps * kCopyStages * 2 * kAtomStage * sizeof(bf16);
 
 // the warp gathers its head's keys and values by Q2K into a private stage (zero for -1)
 __device__ __forceinline__ void gather_atom_kv(bf16* ks, bf16* vs, const bf16* akv,
@@ -296,7 +309,7 @@ __device__ __noinline__ void atom_attention_item(const AtomW& w, int b, int u, i
     constexpr int kChunks = NK / kAtomKeys;
     const float scale = 1.f / sqrtf(float(kAtomHeadD));
     const int h = warp_id(), A = c_kp.A;
-    bf16* sm = reinterpret_cast<bf16*>(smem_base()) + h * 2 * 2 * kAtomStage;
+    bf16* sm = reinterpret_cast<bf16*>(smem_base()) + h * kCopyStages * 2 * kAtomStage;
     const size_t row0 = size_t(s) * A + u * kSubset;
     const bf16* akv = c_kp.buf.akv + size_t(s) * A * 2 * kAtomC + h * kAtomHeadD;
     const int* q2k = c_kp.geo.q2k + u * NK;
@@ -334,10 +347,11 @@ __device__ __noinline__ void atom_attention_item(const AtomW& w, int b, int u, i
     async_commit();
 #pragma unroll 1
     for (int c = 0; c < kChunks; c++) {
-        bf16* ks = sm + (c % 2) * 2 * kAtomStage;
+        bf16* ks = sm + (c % kCopyStages) * 2 * kAtomStage;
         bf16* vs = ks + kAtomStage;
-        if (c + 1 < kChunks) {
-            bf16* kn = sm + ((c + 1) % 2) * 2 * kAtomStage;
+        bf16* kn = sm + ((c + 1) % kCopyStages) * 2 * kAtomStage;
+        const bool next = c + 1 < kChunks;
+        if (next && kCopyStages > 1) {
             gather_atom_kv(kn, kn + kAtomStage, akv, q2k + (c + 1) * kAtomKeys);
         }
         async_commit();
@@ -383,7 +397,7 @@ __device__ __noinline__ void atom_attention_item(const AtomW& w, int b, int u, i
             FragA p[kAtomQT];
 #pragma unroll
             for (int qt = 0; qt < kAtomQT; qt++) {
-                p[qt] = acc_to_a(sc[qt][kt]);
+                p[qt] = acc_to_a(sc[qt][kt], ks); // K is read: its stage holds the tile
             }
 #pragma unroll
             for (int dt = 0; dt < kAtomDT; dt++) {
@@ -396,6 +410,9 @@ __device__ __noinline__ void atom_attention_item(const AtomW& w, int b, int u, i
             }
         }
         __syncwarp();
+        if (next && kCopyStages == 1) { // one stage: refilled once read
+            gather_atom_kv(kn, kn + kAtomStage, akv, q2k + (c + 1) * kAtomKeys);
+        }
     }
     sm_state.finish();
 #pragma unroll

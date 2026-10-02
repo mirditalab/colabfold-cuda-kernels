@@ -37,6 +37,9 @@
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEventElapsedTime hipEventElapsedTime
+#define cudaEventDestroy hipEventDestroy
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 
 // HIP names a __constant__ symbol through HIP_SYMBOL
 #define cudaMemcpyToSymbolAsync(symbol, ...) hipMemcpyToSymbolAsync(HIP_SYMBOL(symbol), __VA_ARGS__)

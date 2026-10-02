@@ -23,9 +23,32 @@ constexpr int kPieceElems = kPieceRows * kW1Ld;
 __host__ __device__ constexpr int half_unit_elems(int parts) {
     return parts * kHalfUnit * kW1Ld + kAtomC * kW2Ld;
 }
-constexpr int kRingElems = 3 * half_unit_elems(2); // 2 slots of three parts, 5 pieces
-static_assert(2 * half_unit_elems(kMaxParts) <= kRingElems && kPieceElems <= half_unit_elems(2),
-              "the ring holds at least two stages");
+// ring stages per half-unit: with one slot (synchronous copies) its W1 rows and W2 columns are two
+// stages, so the slot holds the larger, not both
+constexpr int kUnitStages = kCopyStages > 1 ? 1 : 2;
+__host__ __device__ constexpr int unit_stage_elems(int parts) {
+    return kUnitStages == 1                             ? half_unit_elems(parts)
+           : parts * kHalfUnit * kW1Ld > kAtomC * kW2Ld ? parts * kHalfUnit * kW1Ld
+                                                        : kAtomC * kW2Ld;
+}
+// the ring: three slots of two parts (two of three, five pieces) where copies overlap work; one
+// slot of the model's own where they are synchronous
+__host__ __device__ constexpr int ring_elems(int parts) {
+    return kCopyStages > 1 ? 3 * half_unit_elems(2) : unit_stage_elems(parts);
+}
+static_assert(kCopyStages * unit_stage_elems(kMaxParts) <= ring_elems(kMaxParts) &&
+                  kPieceElems <= ring_elems(2),
+              "the ring holds kCopyStages stages");
+// shared memory of the atom row passes: the ring, then the warps' acc_to_a tiles
+__host__ __device__ constexpr size_t atom_rows_smem(int parts) {
+    return (ring_elems(parts) + kWarps * kAccTile) * sizeof(bf16);
+}
+__device__ __forceinline__ int atom_parts() {
+    return c_kp.flags & ATOB ? kMaxParts : 2;
+}
+__device__ __forceinline__ bf16* atom_rows_tile() {
+    return reinterpret_cast<bf16*>(smem_base()) + ring_elems(atom_parts()) + warp_id() * kAccTile;
+}
 
 __device__ __forceinline__ void copy_piece(bf16* st, const bf16* w) {
     constexpr int kRowCopies = kAtomC / 8;
@@ -70,6 +93,9 @@ template <class Stager> struct Ring {
             stager.copy(sm + (i + ring - 1) % ring * slot, i + ring - 1);
         }
         async_commit();
+        if (ring == 1) { // the one slot was refilled just now, synchronously
+            __syncthreads();
+        }
         return sm + i % ring * slot;
     }
 };
@@ -89,13 +115,28 @@ __device__ __forceinline__ void warp_gemm_lds(Acc (&d)[NT], const FragA (&a)[KT]
     }
 }
 
-// the two values at p (columns c, c + 1)
-__device__ __forceinline__ float2 pair_of(const bf16* p) {
-    const uint32_t u = ld32(p);
-    return make_float2(from_bf(u & 0xFFFFu), from_bf(u >> 16));
+__device__ __forceinline__ float as_f32(bf16 x) {
+    return from_bf(x);
 }
-__device__ __forceinline__ float2 pair_of(const float* p) {
-    return *reinterpret_cast<const float2*>(p);
+__device__ __forceinline__ float as_f32(float x) {
+    return x;
+}
+
+// the lane's row pointers, each moved by off
+template <class T>
+__device__ __forceinline__ void rows_at(const T* (&out)[kRowSlots],
+                                        const T* const (&rows)[kRowSlots], int off) {
+#pragma unroll
+    for (int j = 0; j < kRowSlots; j++) {
+        out[j] = rows[j] + off;
+    }
+}
+template <class T>
+__device__ __forceinline__ void rows_at(const T* (&out)[kRowSlots], const T* all, int off) {
+#pragma unroll
+    for (int j = 0; j < kRowSlots; j++) {
+        out[j] = all + off;
+    }
 }
 
 // ---- rows held as accumulators: lane values at (r0 + acc_row(i), 16 nt + acc_col(i))
@@ -112,21 +153,28 @@ __device__ __forceinline__ void acc_load(Acc (&x)[kChanT], const float* p) {
 #pragma unroll
     for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-        for (int i = 0; i < kAccVals; i += 2) {
-            const float2 v = pair_of(p + acc_row(i) * kAtomC + nt * kMma + acc_col(i));
-            x[nt].v[i] = v.x, x[nt].v[i + 1] = v.y;
+        for (int i = 0; i < kAccVals; i += kAdj) {
+            const Adj<float> v = adj(p + acc_row(i) * kAtomC + nt * kMma + acc_col(i));
+#pragma unroll
+            for (int j = 0; j < kAdj; j++) {
+                x[nt].v[i + j] = v.v[j];
+            }
         }
     }
 }
 
-// bf16 pairs into columns col0.. of rows of an [rows][ld] matrix
+// bf16 into columns col0.. of rows of an [rows][ld] matrix
 __device__ __forceinline__ void acc_store_bf(const Acc (&x)[kChanT], bf16* p, int ld, int col0) {
 #pragma unroll
     for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-        for (int i = 0; i < kAccVals; i += 2) {
-            *reinterpret_cast<uint32_t*>(p + acc_row(i) * ld + col0 + nt * kMma + acc_col(i)) =
-                pack_bf2(x[nt].v[i], x[nt].v[i + 1]);
+        for (int i = 0; i < kAccVals; i += kAdj) {
+            Adj<bf16> v;
+#pragma unroll
+            for (int j = 0; j < kAdj; j++) {
+                v.v[j] = bf16(to_bf(x[nt].v[i + j]));
+            }
+            adj(p + acc_row(i) * ld + col0 + nt * kMma + acc_col(i)) = v;
         }
     }
 }
@@ -179,19 +227,22 @@ __device__ __forceinline__ void acc_affine(Acc (&y)[kChanT], const Acc (&x)[kCha
 #pragma unroll
     for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-        for (int i = 0; i < kAccVals; i += 2) {
+        for (int i = 0; i < kAccVals; i += kAdj) {
             const int c = nt * kMma + acc_col(i), rs = row_slot(i);
-            const float2 sc = pair_of(scale[rs] + c), of = pair_of(offset[rs] + c);
-            y[nt].v[i] = x[nt].v[i] * sc.x + of.x;
-            y[nt].v[i + 1] = x[nt].v[i + 1] * sc.y + of.y;
+            const Adj<T> sc = adj(scale[rs] + c), of = adj(offset[rs] + c);
+#pragma unroll
+            for (int j = 0; j < kAdj; j++) {
+                y[nt].v[i + j] = x[nt].v[i + j] * as_f32(sc.v[j]) + as_f32(of.v[j]);
+            }
         }
     }
 }
 
-__device__ __forceinline__ void acc_to_a_all(FragA (&a)[kChanT], const Acc (&x)[kChanT]) {
+__device__ __forceinline__ void acc_to_a_all(FragA (&a)[kChanT], const Acc (&x)[kChanT],
+                                             bf16* tile) {
 #pragma unroll
     for (int kt = 0; kt < kChanT; kt++) {
-        a[kt] = acc_to_a(x[kt]);
+        a[kt] = acc_to_a(x[kt], tile);
     }
 }
 
@@ -257,8 +308,8 @@ __device__ __forceinline__ void qk_norm(Acc (&o)[kChanT], const float* qkn, int 
                                         const float* const (&rope)[kRowSlots]) {
     if (c_kp.flags & QKNORM) {
         acc_norm(o, false, kLnEps);
-        const float* s[kRowSlots] = {qkn + scale * kAtomC, qkn + scale * kAtomC};
-        const float* f[kRowSlots] = {qkn + offset * kAtomC, qkn + offset * kAtomC};
+        const float *s[kRowSlots], *f[kRowSlots];
+        rows_at(s, qkn, scale * kAtomC), rows_at(f, qkn, offset * kAtomC);
         acc_affine(o, o, s, f);
     } else if (c_kp.flags & ESM) {
         acc_head_rope(o, rope);
@@ -273,7 +324,8 @@ __device__ __noinline__ void atom_proj_item(const AtomW& w, int b, int row0, int
     const ProjStager stager{w.wqg + size_t(b) * 2 * kAtomC * kAtomC,
                             w.wkv + size_t(b) * 2 * kAtomC * kAtomC};
     const Ring<ProjStager> ring{stager, reinterpret_cast<bf16*>(smem_base()), kPieceElems,
-                                kRingElems / kPieceElems};
+                                ring_elems(atom_parts()) / kPieceElems};
+    bf16* tile = atom_rows_tile();
     ring.start();
     const bf16* am[kRowSlots];
     const float* rope[kRowSlots];
@@ -290,25 +342,24 @@ __device__ __noinline__ void atom_proj_item(const AtomW& w, int b, int row0, int
         Acc x[kChanT], y[kChanT];
         acc_load(x, c_kp.buf.qa + size_t(r0) * kAtomC);
         acc_norm(x, esm, c_kp.atom_eps);
-        const bf16* qs[kRowSlots] = {am[0] + AM_Q_SCALE * kAtomC, am[1] + AM_Q_SCALE * kAtomC};
-        const bf16* qb[kRowSlots] = {am[0] + AM_Q_BIAS * kAtomC, am[1] + AM_Q_BIAS * kAtomC};
+        const bf16 *qs[kRowSlots], *qb[kRowSlots];
+        rows_at(qs, am, AM_Q_SCALE * kAtomC), rows_at(qb, am, AM_Q_BIAS * kAtomC);
         acc_affine(y, x, qs, qb);
-        acc_to_a_all(aq, y);
+        acc_to_a_all(aq, y, tile);
         if (c_kp.flags & CHAIN_K) {
 #pragma unroll
             for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    x[nt].v[2 * j] = from_bf(aq[nt].r[j] & 0xFFFFu);
-                    x[nt].v[2 * j + 1] = from_bf(aq[nt].r[j] >> 16);
+                for (int i = 0; i < kAccVals; i++) {
+                    x[nt].v[i] = from_bf(to_bf(y[nt].v[i])); // bf16(xq), as aq holds it
                 }
             }
             acc_norm(x, esm, c_kp.atom_eps);
         }
-        const bf16* ks[kRowSlots] = {am[0] + AM_K_SCALE * kAtomC, am[1] + AM_K_SCALE * kAtomC};
-        const bf16* kb[kRowSlots] = {am[0] + AM_K_BIAS * kAtomC, am[1] + AM_K_BIAS * kAtomC};
+        const bf16 *ks[kRowSlots], *kb[kRowSlots];
+        rows_at(ks, am, AM_K_SCALE * kAtomC), rows_at(kb, am, AM_K_BIAS * kAtomC);
         acc_affine(y, x, ks, kb);
-        acc_to_a_all(ak, y);
+        acc_to_a_all(ak, y, tile);
     }
 
     constexpr int kQuarter = ProjStager::kStages / 4;
@@ -356,7 +407,7 @@ __device__ void atom_proj(Deal& d, const AtomW& w, int b) {
 
 struct MlpStager {
     static constexpr int kWoPieces = kAtomC / kPieceRows;
-    static constexpr int kStages = kWoPieces + kAtomHidden / kHalfUnit;
+    static constexpr int kStages = kWoPieces + kUnitStages * kAtomHidden / kHalfUnit;
     const bf16 *wo, *w1, *w2;
     int parts;
     __device__ void copy(bf16* st, int i) const {
@@ -365,16 +416,17 @@ struct MlpStager {
             return;
         }
         constexpr int kRowCopies = kAtomC / 8;
-        const int u = (i - kWoPieces) / 2, h = (i - kWoPieces) % 2;
-        for (int k = threadIdx.x; k < parts * kHalfUnit * kRowCopies; k += kThreads) {
+        const int j = i - kWoPieces, u = j / kUnitStages / 2, h = j / kUnitStages % 2;
+        const bool w1_part = kUnitStages == 1 || j % 2 == 0, w2_part = kUnitStages == 1 || j % 2;
+        for (int k = threadIdx.x; w1_part && k < parts * kHalfUnit * kRowCopies; k += kThreads) {
             const int r = k / kRowCopies, c = k % kRowCopies * 8;
             const int src =
                 u * parts * kGluHalf + r / kHalfUnit * kGluHalf + h * kHalfUnit + r % kHalfUnit;
             async_copy16(st + r * kW1Ld + c, w1 + src * kAtomC + c, true);
         }
-        bf16* s2 = st + parts * kHalfUnit * kW1Ld;
+        bf16* s2 = kUnitStages == 1 ? st + parts * kHalfUnit * kW1Ld : st;
         constexpr int kW2Copies = kHalfUnit / 8;
-        for (int k = threadIdx.x; k < kAtomC * kW2Copies; k += kThreads) {
+        for (int k = threadIdx.x; w2_part && k < kAtomC * kW2Copies; k += kThreads) {
             const int r = k / kW2Copies, c = k % kW2Copies * 8;
             async_copy16(s2 + r * kW2Ld + c,
                          w2 + r * kAtomHidden + u * kGluHalf + h * kHalfUnit + c, true);
@@ -391,12 +443,13 @@ enum MlpTail {
 
 // one CTA item: rows row0.. (16 per warp) through the block's attention output and transition
 __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int rows, int tail) {
-    const int A = c_kp.A, parts = c_kp.flags & ATOB ? kMaxParts : 2;
+    const int A = c_kp.A, parts = atom_parts();
     const MlpStager stager{w.wo + size_t(b) * kAtomC * kAtomC, w.w1 + size_t(b) * c_kp.aw1 * kAtomC,
                            w.w2 + size_t(b) * kAtomC * kAtomHidden, parts};
-    const int slot = half_unit_elems(parts);
+    const int slot = unit_stage_elems(parts);
     const Ring<MlpStager> ring{stager, reinterpret_cast<bf16*>(smem_base()), slot,
-                               kRingElems / slot};
+                               ring_elems(parts) / slot};
+    bf16* tile = atom_rows_tile();
     const int r0 = row0 + warp_id() * kMma;
     const bool active = r0 < rows; // every warp keeps to the barriers
     float* qa = c_kp.buf.qa + size_t(active ? r0 : 0) * kAtomC;
@@ -441,30 +494,34 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
 #pragma unroll
         for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-            for (int v = 0; v < kAccVals; v += 2) {
+            for (int v = 0; v < kAccVals; v += kAdj) {
                 const int c = nt * kMma + acc_col(v);
-                const float2 in = pair_of(qa + acc_row(v) * kAtomC + c);
-                const float2 g = pair_of(am[row_slot(v)] + AM_ATTN_GATE * kAtomC + c);
-                tin[nt].v[v] = in.x + g.x * x[nt].v[v];
-                tin[nt].v[v + 1] = in.y + g.y * x[nt].v[v + 1];
-                x[nt].v[v] = parallel ? in.x : tin[nt].v[v];
-                x[nt].v[v + 1] = parallel ? in.y : tin[nt].v[v + 1];
+                const Adj<float> in = adj(qa + acc_row(v) * kAtomC + c);
+                const Adj<bf16> g = adj(am[row_slot(v)] + AM_ATTN_GATE * kAtomC + c);
+#pragma unroll
+                for (int j = 0; j < kAdj; j++) {
+                    tin[nt].v[v + j] = in.v[j] + from_bf(g.v[j]) * x[nt].v[v + j];
+                    x[nt].v[v + j] = parallel ? in.v[j] : tin[nt].v[v + j];
+                }
             }
         }
         acc_norm(x, c_kp.flags & ESM, c_kp.atom_eps);
-        const bf16* ts[kRowSlots] = {am[0] + AM_T_SCALE * kAtomC, am[1] + AM_T_SCALE * kAtomC};
-        const bf16* tb[kRowSlots] = {am[0] + AM_T_BIAS * kAtomC, am[1] + AM_T_BIAS * kAtomC};
+        const bf16 *ts[kRowSlots], *tb[kRowSlots];
+        rows_at(ts, am, AM_T_SCALE * kAtomC), rows_at(tb, am, AM_T_BIAS * kAtomC);
         acc_affine(x, x, ts, tb);
-        acc_to_a_all(a, x);
+        acc_to_a_all(a, x, tile);
     }
 
     // 3. per half-unit: [gate | proj (| a_to_b)] = x·W1ᵀ, c = silu(gate)·proj(·a_to_b), y += c·W2ᵀ
     Acc y[kChanT];
     acc_zero_all(y);
 #pragma unroll 1
-    for (int i = MlpStager::kWoPieces; i < MlpStager::kStages; i++) {
+    for (int i = MlpStager::kWoPieces; i < MlpStager::kStages; i += kUnitStages) {
         const bf16* st = ring.at(i);
         if (!active) {
+            if (kUnitStages > 1) {
+                ring.at(i + 1); // every warp keeps to the ring's barriers
+            }
             continue;
         }
         Acc g[1], p[1];
@@ -483,8 +540,9 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
                 p[0].v[v] *= g[0].v[v];
             }
         }
-        const FragA c[1] = {acc_to_a(p[0])};
-        warp_gemm_lds(y, c, st + parts * kHalfUnit * kW1Ld, kW2Ld);
+        const FragA c[1] = {acc_to_a(p[0], tile)};
+        const bf16* s2 = kUnitStages > 1 ? ring.at(i + 1) : st + parts * kHalfUnit * kW1Ld;
+        warp_gemm_lds(y, c, s2, kW2Ld);
     }
     __syncthreads(); // the next item refills the ring from slot 0
     if (!active) {
@@ -494,14 +552,17 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
 #pragma unroll
     for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-        for (int v = 0; v < kAccVals; v += 2) {
+        for (int v = 0; v < kAccVals; v += kAdj) {
             const int c = nt * kMma + acc_col(v), rs = row_slot(v);
-            const float2 g = pair_of(am[rs] + AM_T_GATE * kAtomC + c);
-            tin[nt].v[v] += qmask[rs] * g.x * y[nt].v[v];
-            tin[nt].v[v + 1] += qmask[rs] * g.y * y[nt].v[v + 1];
-            *reinterpret_cast<float2*>(qa + acc_row(v) * kAtomC + c) =
-                make_float2(tin[nt].v[v], tin[nt].v[v + 1]);
-            tin[nt].v[v] *= qmask[rs], tin[nt].v[v + 1] *= qmask[rs];
+            const Adj<bf16> g = adj(am[rs] + AM_T_GATE * kAtomC + c);
+            Adj<float> out;
+#pragma unroll
+            for (int j = 0; j < kAdj; j++) {
+                tin[nt].v[v + j] += qmask[rs] * from_bf(g.v[j]) * y[nt].v[v + j];
+                out.v[j] = tin[nt].v[v + j];
+                tin[nt].v[v + j] *= qmask[rs];
+            }
+            adj(qa + acc_row(v) * kAtomC + c) = out;
         }
     }
     if (tail == TAIL_SKIP) {
@@ -509,10 +570,14 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
 #pragma unroll
         for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-            for (int v = 0; v < kAccVals; v += 2) {
+            for (int v = 0; v < kAccVals; v += kAdj) {
                 const int at = acc_row(v) * kAtomC + nt * kMma + acc_col(v);
-                *reinterpret_cast<float2*>(c_kp.buf.skip + off + at) =
-                    make_float2(tin[nt].v[v], tin[nt].v[v + 1]);
+                Adj<float> out;
+#pragma unroll
+                for (int j = 0; j < kAdj; j++) {
+                    out.v[j] = tin[nt].v[v + j];
+                }
+                adj(c_kp.buf.skip + off + at) = out;
             }
         }
         acc_store_bf(tin, c_kp.buf.abf + off, kAtomC, 0);

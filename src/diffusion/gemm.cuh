@@ -10,30 +10,36 @@
 
 namespace mk {
 
-constexpr int kBK = 32;      // k per pipeline stage
-constexpr int kStagePad = 4; // floats of padding per staged epilogue row
-// rows staged per epilogue pass; a multiple of a token's 32 gathered rows
-constexpr int kEpiRows = 64;
-constexpr int kLdsPad = 8; // bf16 of padding per portable smem row: conflict-free ldmatrix
+// k per pipeline stage, rows staged per epilogue pass (a multiple of a token's 32 gathered rows)
+// and floats of padding per staged row
+#if CCK_AMD
+// operands wait in registers; a tile fits 16 KB, which four CTAs per WGP leave; the slab swizzle
+// (frag.cuh) swaps a row's two halves, so a slab is 16 wide
+constexpr int kBK = 16, kEpiRows = 32, kStagePad = 0;
+#else
+constexpr int kBK = 32, kEpiRows = 64, kStagePad = 4;
+#endif
 
 // the reference's tile codes, which the harness passes to mk_gemm_test
-enum TileCode : int { T64 = 64, T128 = 256, T128x96 = 296, T96 = 396 };
+enum TileCode : int { T64 = 64, T64x128 = 128, T128 = 256, T128x96 = 296, T96 = 396 };
 struct TileInfo {
     int code, bm, bn;
-    float speed;
+    float speed;  // relative throughput on this vendor; 0 where it does not run
     bool gathers; // has the portable implementation, which can gather rows
 };
-constexpr int kNumTiles = 4;
+constexpr int kNumTiles = 5;
 __host__ __device__ constexpr TileInfo tile_info(int i) {
     switch (i) {
     case 0:
         return {T128, 128, 128, 1.0f, true};
     case 1:
-        return {T128x96, 128, 96, 0.95f, false};
+        return {T128x96, 128, 96, CCK_AMD ? 0.f : 0.95f, false}; // CuTe's
     case 2:
-        return {T96, 96, 96, 0.9f, false};
+        return {T96, 96, 96, CCK_AMD ? 0.f : 0.9f, false};
+    case 3:
+        return {T64x128, 64, 128, CCK_AMD ? 0.97f : 0.f, true};
     default:
-        return {T64, 64, 64, 0.55f, true};
+        return {T64, 64, 64, CCK_AMD ? 0.6f : 0.55f, true};
     }
 }
 __host__ __device__ constexpr TileInfo tile_of(int code) {
@@ -56,7 +62,7 @@ __host__ __device__ inline int choose_tile(int m, int n, int unit, bool gathered
     float best_cost = 3.4e38f;
     for (int i = 0; i < kNumTiles; i++) {
         const TileInfo t = tile_info(i);
-        if (n % t.bn || (unit && t.bn % unit) || (gathered && !t.gathers)) {
+        if (!t.speed || n % t.bn || (unit && t.bn % unit) || (gathered && !t.gathers)) {
             continue;
         }
         const float cost = cdiv(cdiv(m, t.bm) * (n / t.bn), grid) * float(t.bm * t.bn) / t.speed;
@@ -238,16 +244,16 @@ __device__ void epi_aggr(const Gemm& g, const float* st, int row0, int rows, int
 // rows' terms and walks the columns; a warp's lanes store consecutive row pairs.
 template <int kld>
 __device__ void epi_pair(const Gemm& g, const float* st, int row0, int rows, int col0, int cols) {
-    const int pairs = rows / 2, rp = threadIdx.x % pairs, row = row0 + 2 * rp;
+    // rows kAdj rp.. are a lane's adjacent values of the table: side by side in memory
+    const int pairs = rows / kAdj, rp = threadIdx.x % pairs, row = row0 + kAdj * rp;
     if (row >= g.m) {
         return;
     }
-    int q, k; // rows 2rp and 2rp + 1 are keys k and k + 1 of query q
-    pair_of_row(row, g.np, q, k);
-    float mean[2], rstd[2], extra[2];
-    bool masked[2], pad[2];
-    for (int j = 0; j < 2; j++) {
-        const int kk = k + j;
+    float mean[kAdj], rstd[kAdj], extra[kAdj];
+    bool masked[kAdj], pad[kAdj];
+    for (int j = 0; j < kAdj; j++) {
+        int q, kk;
+        pair_of_row(row + j, g.np, q, kk);
         masked[j] = kk >= g.period || g.tmask[kk] == 0.f;
         pad[j] = q >= g.period;
         mean[j] = rstd[j] = extra[j] = 0.f;
@@ -261,14 +267,16 @@ __device__ void epi_pair(const Gemm& g, const float* st, int row0, int rows, int
     bf16* out = static_cast<bf16*>(g.out) + row;
     for (int c = threadIdx.x / pairs; c < cols && col0 + c < g.n; c += kThreads / pairs) {
         const int col = col0 + c;
-        float v[2];
-        for (int j = 0; j < 2; j++) {
-            const float x = st[(2 * rp + j) * kld + c];
-            v[j] = masked[j] ? -kMaskBias
-                   : pad[j]  ? 0.f
-                             : rstd[j] * (x - mean[j] * g.plws[col]) + g.plb[col] + extra[j];
+        Adj<bf16> v;
+        for (int j = 0; j < kAdj; j++) {
+            const float x = st[(kAdj * rp + j) * kld + c];
+            const float y = masked[j] ? -kMaskBias
+                            : pad[j]
+                                ? 0.f
+                                : rstd[j] * (x - mean[j] * g.plws[col]) + g.plb[col] + extra[j];
+            v.v[j] = bf16(to_bf(y * kLog2e));
         }
-        *reinterpret_cast<uint32_t*>(out + col * plane) = pack_bf2(v[0] * kLog2e, v[1] * kLog2e);
+        adj(out + col * plane) = v;
     }
 }
 
@@ -326,42 +334,63 @@ __device__ __forceinline__ const bf16* a_row(const Gemm& g, int row) {
     }
 }
 
-template <int Code, int STAGES> struct Portable {
+// a portable tile's pipeline slots and bf16 of padding per smem row (conflict-free fragment
+// loads); AMD's within 16 KB, where only the 64-row tile has room to pad
+struct PortableCfg {
+    int stages, pad;
+};
+__host__ __device__ constexpr PortableCfg portable_cfg(int code) {
+#if CCK_AMD
+    return code == T64 ? PortableCfg{2, 8} : PortableCfg{2, 0};
+#else
+    return code == T64 ? PortableCfg{3, 8} : PortableCfg{2, 8};
+#endif
+}
+
+template <int Code> struct Portable {
     static constexpr int BM = tile_of(Code).bm, BN = tile_of(Code).bn;
-    static_assert(BM == BN, "each thread copies the same rows of A and W");
-    static constexpr int kLd = kBK + kLdsPad;
-    static constexpr int kCopies = BM * kBK / 8 / kThreads; // 16-byte copies per thread per operand
-    static constexpr int kRowStep = kThreads * 8 / kBK;     // rows between a thread's copies
+    static_assert(BM <= BN, "a thread copies W's rows alongside A's, then the rest of W's");
+    static constexpr int STAGES = portable_cfg(Code).stages, BK = kBK;
+    static constexpr int kLd = BK + portable_cfg(Code).pad;
+    static constexpr int kCopiesA = BM * BK / 8 / kThreads; // 16-byte copies per thread
+    static constexpr int kCopiesW = BN * BK / 8 / kThreads;
+    static constexpr int kRowStep = kThreads * 8 / BK; // rows between a thread's copies
     static constexpr int MT = BM / 2 / kMma, NT = BN / 2 / kMma;
     static constexpr int kSld = BN + kStagePad;
-    static constexpr size_t kSmem = STAGES * (BM + BN) * kLd * sizeof(bf16);
-    static_assert(kSmem >= kEpiRows * kSld * sizeof(float), "staging must fit the pipeline smem");
+    static constexpr size_t kPipe = STAGES * (BM + BN) * kLd * sizeof(bf16);
+    static constexpr size_t kStage = kEpiRows * kSld * sizeof(float);
+    static constexpr size_t kSmem =
+        kPipe > kStage ? kPipe : kStage; // staging reuses the pipeline's
 };
 
-// a 2x2 grid of warps; each thread copies the same rows of A and of W, sharing one smem offset
-template <int Code, int STAGES>
+// a 2x2 grid of warps; each thread copies the same rows of A and of W, so square tiles share one
+// smem offset
+template <int Code>
 __device__ __noinline__ void portable_tiles(const Gemm& gd, int t0, int stride) {
-    using P = Portable<Code, STAGES>;
+    using P = Portable<Code>;
+    constexpr int STAGES = P::STAGES, BK = P::BK;
     constexpr int BM = P::BM;
     const Gemm g = gd;
     char* smem = smem_base();
     bf16* sa = reinterpret_cast<bf16*>(smem);
-    bf16* sw = sa + STAGES * BM * P::kLd;
+    bf16* sw = sa + STAGES * BM * P::kLd; // W's slots are BN rows
     float* st = reinterpret_cast<float*>(smem);
     const int warp = threadIdx.x / kWarp, wm = warp % 2, wn = warp / 2;
-    const int crow = threadIdx.x / (kBK / 8), ccol = threadIdx.x % (kBK / 8) * 8;
-    const int mt = cdiv(g.m, BM), tiles = mt * cdiv(g.n, P::BN), ktiles = g.k / kBK;
+    const int crow = threadIdx.x / (BK / 8), ccol = threadIdx.x % (BK / 8) * 8;
+    const int mt = cdiv(g.m, BM), tiles = mt * cdiv(g.n, P::BN), ktiles = g.k / BK;
     for (int t = t0; t < tiles; t += stride) {
         const int row0 = t % mt * BM, col0 = t / mt * P::BN;
-        const bf16* ap[P::kCopies];
-        const bf16* wp[P::kCopies];
+        const bf16* ap[P::kCopiesA];
+        const bf16* wp[P::kCopiesW];
         uint32_t aok = 0, wok = 0;
 #pragma unroll
-        for (int i = 0; i < P::kCopies; i++) {
+        for (int i = 0; i < P::kCopiesW; i++) {
             const int r = crow + i * P::kRowStep;
-            const bf16* p = a_row(g, row0 + r);
-            aok |= uint32_t(p != nullptr) << i;
-            ap[i] = (p ? p : g.a) + ccol;
+            if (i < P::kCopiesA) {
+                const bf16* p = a_row(g, row0 + r);
+                aok |= uint32_t(p != nullptr) << i;
+                ap[i] = (p ? p : g.a) + ccol;
+            }
             wok |= uint32_t(col0 + r < g.n) << i;
             wp[i] = g.w + size_t(col0 + r < g.n ? col0 + r : 0) * g.k + ccol;
         }
@@ -373,20 +402,38 @@ __device__ __noinline__ void portable_tiles(const Gemm& gd, int t0, int stride) 
                 acc_zero(acc[i][j]);
             }
         }
+        Copy16 ca[P::kCopiesA], cw[P::kCopiesW];
         int kload = 0;
+        bool landing = false;
 #pragma unroll 1
         for (int kt = -(STAGES - 1); kt < ktiles; kt++) {
+            if (landing) { // the previous iteration's copies; that slot's readers passed a barrier
+                const int slot = (kload - 1) % STAGES;
+#pragma unroll
+                for (int i = 0; i < P::kCopiesW; i++) {
+                    const int r = crow + i * P::kRowStep;
+                    if (i < P::kCopiesA) {
+                        copy_land(ca[i], sa + (slot * BM + r) * P::kLd + slab_col(r, ccol));
+                    }
+                    copy_land(cw[i], sw + (slot * P::BN + r) * P::kLd + slab_col(r, ccol));
+                }
+            }
             if (kt >= 0) {
                 async_wait<STAGES - 2>();
                 __syncthreads();
             }
-            if (kload < ktiles) {
-                const int slot = kload % STAGES, ko = kload * kBK;
+            landing = kload < ktiles;
+            if (landing) {
+                const int slot = kload % STAGES, ko = kload * BK;
 #pragma unroll
-                for (int i = 0; i < P::kCopies; i++) {
-                    const int off = (slot * BM + crow + i * P::kRowStep) * P::kLd + ccol;
-                    async_copy16(sa + off, ap[i] + ko, aok >> i & 1);
-                    async_copy16(sw + off, wp[i] + ko, wok >> i & 1);
+                for (int i = 0; i < P::kCopiesW; i++) {
+                    const int r = crow + i * P::kRowStep;
+                    if (i < P::kCopiesA) {
+                        copy_start(ca[i], sa + (slot * BM + r) * P::kLd + slab_col(r, ccol),
+                                   ap[i] + ko, aok >> i & 1);
+                    }
+                    copy_start(cw[i], sw + (slot * P::BN + r) * P::kLd + slab_col(r, ccol),
+                               wp[i] + ko, wok >> i & 1);
                 }
             }
             async_commit();
@@ -395,18 +442,18 @@ __device__ __noinline__ void portable_tiles(const Gemm& gd, int t0, int stride) 
                 continue;
             }
             const bf16* as = sa + (kt % STAGES) * BM * P::kLd + wm * (BM / 2) * P::kLd;
-            const bf16* ws = sw + (kt % STAGES) * BM * P::kLd + wn * (P::BN / 2) * P::kLd;
+            const bf16* ws = sw + (kt % STAGES) * P::BN * P::kLd + wn * (P::BN / 2) * P::kLd;
 #pragma unroll
-            for (int ks = 0; ks < kBK; ks += kMma) {
+            for (int ks = 0; ks < BK; ks += kMma) {
                 FragA fa[P::MT];
                 FragB fb[P::NT];
 #pragma unroll
                 for (int i = 0; i < P::MT; i++) {
-                    load_a_lds(fa[i], as + i * kMma * P::kLd + ks, P::kLd);
+                    load_a_slab(fa[i], as + i * kMma * P::kLd + ks, P::kLd);
                 }
 #pragma unroll
                 for (int j = 0; j < P::NT; j++) {
-                    load_b_lds(fb[j], ws + j * kMma * P::kLd + ks, P::kLd);
+                    load_b_slab(fb[j], ws + j * kMma * P::kLd + ks, P::kLd);
                 }
 #pragma unroll
                 for (int i = 0; i < P::MT; i++) {
@@ -570,20 +617,19 @@ template <int Code> __device__ __noinline__ void cute_tiles(const Gemm& gd, int 
 }
 #endif
 
-constexpr int kPortableStages128 = 2; // the 128-row portable tile fits 48 KB only with two stages
-constexpr int kPortableStages64 = 3;
-
 // one non-inlined tile loop per GEMM per CTA: a call per tile spilled callee-saved registers
 __device__ inline void gemm_run(const Gemm& g, int t0, int stride) {
     switch (g.tile) {
-#if !CCK_AMD
     case T128:
+#if !CCK_AMD
         if (g.gather == ROWS_PLAIN) {
             cute_tiles<T128>(g, t0, stride);
-        } else {
-            portable_tiles<T128, kPortableStages128>(g, t0, stride);
+            break;
         }
+#endif
+        portable_tiles<T128>(g, t0, stride);
         break;
+#if !CCK_AMD
     case T128x96:
         cute_tiles<T128x96>(g, t0, stride);
         break;
@@ -591,8 +637,11 @@ __device__ inline void gemm_run(const Gemm& g, int t0, int stride) {
         cute_tiles<T96>(g, t0, stride);
         break;
 #endif
+    case T64x128:
+        portable_tiles<T64x128>(g, t0, stride);
+        break;
     default:
-        portable_tiles<T64, kPortableStages64>(g, t0, stride);
+        portable_tiles<T64>(g, t0, stride);
     }
 }
 
@@ -607,7 +656,11 @@ template <int N> __device__ void run_gemms(Deal& d, const Gemm* const (&list)[N]
     }
 }
 
+#if CCK_AMD
+constexpr size_t kGemmSmem = Portable<T128>::kSmem;
+#else
 constexpr size_t kGemmSmem = CuteTile<T128>::kSmem;
+#endif
 constexpr int kMaxTileRows = tile_of(T128).bm;
 
 } // namespace mk

@@ -101,7 +101,7 @@ struct KP {
 
 } // namespace mk
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 namespace mk {
 __constant__ KP c_kp; // copied from the workspace each launch: reading it from global cost 7-9%
 } // namespace mk

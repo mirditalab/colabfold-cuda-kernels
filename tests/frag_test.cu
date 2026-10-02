@@ -1,5 +1,5 @@
 // Unit test of the fragment layer: nvcc -std=c++17 -arch=sm_120 -I src -I $CUTLASS/include
-// tests/frag_test.cu
+// tests/frag_test.cu, or hipcc -std=c++17 --offload-arch=gfx1151 -I src -x hip tests/frag_test.cu
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,7 +14,7 @@ constexpr int T = kMma;
 // C = A Bᵀ and (A Bᵀ) as bf16 times V, both through global and shared-memory loads
 __global__ void frag_kernel(const bf16* a, const bf16* b, const bf16* v, float* c, float* c_lds,
                             float* pv, int* rc, float* red) {
-    __shared__ __align__(16) bf16 sa[T * T], sb[T * T], sv[T * T];
+    __shared__ __align__(16) bf16 sa[T * T], sb[T * T], sv[T * T], tile[kAccTile];
     for (int i = threadIdx.x; i < T * T; i += kWarp) {
         sa[i] = a[i], sb[i] = b[i], sv[i] = v[i];
     }
@@ -35,7 +35,7 @@ __global__ void frag_kernel(const bf16* a, const bf16* b, const bf16* v, float* 
     load_b_lds_t(fv, sv, T);
     Acc o;
     acc_zero(o);
-    mma(o, acc_to_a(acc), fv);
+    mma(o, acc_to_a(acc, tile), fv);
     float mx[kRowSlots] = {}, sm[kRowSlots] = {};
     for (int i = 0; i < kAccVals; i++) {
         c[acc_row(i) * T + acc_col(i)] = acc.v[i];
@@ -114,10 +114,15 @@ int main() {
         }
         err_red = fmax(err_red, fabs(red[r * 2] - mx) + fabs(red[r * 2 + 1] - sm));
     }
-    // _prep's NVIDIA swizzle: row (lane>>2) + 8((i>>1)&1), column 8(i>>2) + 2(lane&3) + (i&1)
+    // _prep's swizzle: NVIDIA row (lane>>2) + 8((i>>1)&1), column 8(i>>2) + 2(lane&3) + (i&1);
+    // AMD row 2i + (lane>>4), column lane&15
     for (int l = 0; l < kWarp; l++) {
         for (int i = 0; i < kAccVals; i++) {
+#if CCK_AMD
+            int r = 2 * i + (l >> 4), col = l & 15;
+#else
             int r = (l >> 2) + 8 * ((i >> 1) & 1), col = 8 * (i >> 2) + 2 * (l & 3) + (i & 1);
+#endif
             bad_map |= rc[(l * kAccVals + i) * 2] != r || rc[(l * kAccVals + i) * 2 + 1] != col;
         }
     }

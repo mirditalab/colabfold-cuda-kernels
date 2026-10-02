@@ -21,8 +21,8 @@ extern "C" int mk_gemm_test(const uint16_t* A, const uint16_t* W, float* C, int 
     Gemm g{};
     g.a = da, g.w = dw, g.out = dc, g.lda = K, g.ldo = N, g.m = M, g.n = N, g.k = K;
     g.epi = EPI_F32, g.gather = ROWS_PLAIN, g.tile = tile;
-    cudaFuncSetAttribute(mk_gemm_test_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         int(kGemmSmem));
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(mk_gemm_test_kernel),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, int(kGemmSmem));
     mk_gemm_test_kernel<<<gemm_tiles(g), kThreads, kGemmSmem>>>(g);
     cudaMemcpy(C, dc, size_t(M) * N * sizeof(float), cudaMemcpyDeviceToHost);
     const cudaError_t err = cudaGetLastError();

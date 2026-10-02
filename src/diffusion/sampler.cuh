@@ -6,7 +6,7 @@
 #include "diffusion/attention.cuh"
 #include "diffusion/positions.cuh"
 
-#ifdef CCK_TIMING
+#if defined(CCK_TIMING) && !CCK_AMD
 #include <cuda/std/chrono>
 #endif
 
@@ -40,9 +40,13 @@ __device__ __forceinline__ Deal deal(const Run& r) {
 
 #ifdef CCK_TIMING
 __device__ inline uint64_t now_ns() {
+#if CCK_AMD
+    return wall_clock64() * 10; // gfx11's constant 100 MHz clock
+#else
     return cuda::std::chrono::duration_cast<cuda::std::chrono::nanoseconds>(
                cuda::std::chrono::system_clock::now().time_since_epoch())
         .count();
+#endif
 }
 #endif
 

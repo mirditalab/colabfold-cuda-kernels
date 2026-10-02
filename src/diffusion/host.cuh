@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cfloat>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +45,7 @@ struct Template {
     int steps, cs, nb, tw1, aw1, nk, plc, plx, plg;
     size_t off[kNumBufs], bytes[kNumBufs];
     size_t table_off, zero_begin, zero_end, total;
+    size_t smem; // shared memory per CTA
 };
 
 static size_t pair_budget() {
@@ -63,11 +65,18 @@ static size_t pair_budget() {
     return budget;
 }
 
+// shared memory over all phases; the atom passes' ring is as wide as the model's GLU units
+static size_t smem_for(uint32_t flags) {
+    return std::max(
+        {kGemmSmem, kTokAttnSmem, kAtomAttnSmem, atom_rows_smem(flags & ATOB ? kMaxParts : 2)});
+}
+
 // widths come from the inputs' byte sizes, never from a model name
 static Template make_template(int S, int Nb, int NSb, int nsteps, uint32_t flags,
                               const size_t* in) {
     Template t{};
     t.S = S, t.Nb = Nb, t.NSb = NSb, t.nsteps = nsteps, t.flags = flags;
+    t.smem = smem_for(flags);
     t.steps = int(in[SIGMA] / sizeof(float)) - 1;
     t.cs = int(in[SC_BASE] / (size_t(Nb) * sizeof(float)));
     t.nb = int(in[WQKVG] / (size_t(kQKVG) * kTokC * sizeof(bf16)));
@@ -145,7 +154,8 @@ __device__ void build_gemms(const KP& p, GemmTable& t, int grid) {
     const int N = p.N, cs = p.cs, rt = p.S * N, ra = p.S * p.A;
     const bool idscale = p.flags & IDSCALE;
     const bf16* x = idscale ? b.scbf : b.scln0; // the adaLN modulations' input
-    const int unit = p.flags & ATOB ? 3 * kGluHalf : 2 * kGluHalf;
+    // 64, 96 with the a_to_b gate, or 128 where the prep pads those units for AMD's tiles
+    const int unit = p.tw1 / (kTokHidden / kGluHalf);
     for (int i = 0; i < 2; i++) {
         Gemm& g1 = t.st_w1[i];
         g1 = make_gemm(b.sct, cs, w.st_w1[i], N, 4 * cs, cs, EPI_GLU, b.sch, 2 * cs);
@@ -237,17 +247,17 @@ __global__ void mk_configure(KP p, const int* ext, char* ws, size_t table_off, s
 }
 
 // ---- launch
-constexpr size_t kSmem = std::max({kGemmSmem, kTokAttnSmem, kAtomAttnSmem}); // over all phases
-
-static int default_grid() {
+static int default_grid(size_t smem) {
+    static size_t grid_smem = 0; // the shared memory the grid below was sized for
     static int grid = 0;
-    if (!grid) {
+    if (smem != grid_smem) {
         int dev, sms, occ;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaFuncSetAttribute(mk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem));
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, mk_kernel, kThreads, kSmem);
-        grid = occ * sms;
+        cudaFuncSetAttribute(reinterpret_cast<const void*>(mk_kernel),
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem_for(ATOB)));
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, mk_kernel, kThreads, smem);
+        grid = occ * sms, grid_smem = smem;
         if (const char* env = getenv("MK_GRID")) {
             grid = atoi(env);
         }
@@ -344,7 +354,7 @@ static cudaError_t launch(const Template& t, KP p, const int* ext, char* ws, int
                                             t.bytes[B_PLG], grid);
     cudaMemcpyToSymbolAsync(c_kp, ws, sizeof(KP), 0, cudaMemcpyDeviceToDevice, st);
     return cudaLaunchCooperativeKernel(reinterpret_cast<void*>(mk_kernel), grid, kThreads, nullptr,
-                                       kSmem, st);
+                                       t.smem, st);
 }
 
 // ---- ctypes
@@ -390,11 +400,11 @@ extern "C" int mk_setup(int S, int N, int A, int NS, int steps, const void** hos
     cudaMalloc(&g_state.ws, g_state.t.total);
     cudaMalloc(&g_state.ext, kExtent * sizeof(int));
     cudaMalloc(&g_state.timing, kTimingWords * sizeof(unsigned long long));
-    g_state.grid = default_grid();
+    g_state.grid = default_grid(g_state.t.smem);
     if (getenv("MK_VERBOSE")) {
         printf("mk: %d CTAs, %zu B shared memory per CTA; pair logits for %d of %d blocks; "
                "workspace %zu MB\n",
-               g_state.grid, kSmem, g_state.t.plg, g_state.t.nb, g_state.t.total >> 20);
+               g_state.grid, g_state.t.smem, g_state.t.plg, g_state.t.nb, g_state.t.total >> 20);
     }
     return cudaGetLastError() == cudaSuccess ? 0 : 1;
 }
@@ -403,7 +413,7 @@ extern "C" int mk_set_grid(int grid) {
     if (grid > 0) {
         g_state.grid = grid;
     }
-    return g_state.grid ? g_state.grid : default_grid();
+    return g_state.grid ? g_state.grid : default_grid(g_state.t.smem);
 }
 
 extern "C" int mk_run(int mode, int nsteps, int dbg_stop, uint64_t seed, const float* xn, float t,
@@ -425,7 +435,7 @@ extern "C" int mk_run(int mode, int nsteps, int dbg_stop, uint64_t seed, const f
         cudaEventRecord(e0);
         cudaMemcpyToSymbolAsync(c_kp, s.ws, sizeof(KP), 0, cudaMemcpyDeviceToDevice, 0);
         cudaLaunchCooperativeKernel(reinterpret_cast<void*>(mk_kernel), s.grid, kThreads, nullptr,
-                                    kSmem, 0);
+                                    s.t.smem, 0);
     } else {
         cudaEventRecord(e0);
         launch(s.t, p, s.ext, s.ws, s.grid, 0);
@@ -514,7 +524,7 @@ static ffi::Error mk_sample(cudaStream_t stream, ffi::RemainingArgs args,
     char* w = static_cast<char*>(ws->untyped_data());
     KP p = make_kp(t, in, w, static_cast<float*>(out->untyped_data()));
     const cudaError_t err =
-        launch(t, p, static_cast<const int*>(ext->untyped_data()), w, default_grid(), stream);
+        launch(t, p, static_cast<const int*>(ext->untyped_data()), w, default_grid(t.smem), stream);
     if (err != cudaSuccess) {
         return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(err));
     }
