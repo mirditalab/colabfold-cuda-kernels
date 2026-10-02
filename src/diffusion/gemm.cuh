@@ -1,0 +1,595 @@
+// GEMM tiles (portable and CuTe), their epilogues, the tile chooser and run_gemms.
+#pragma once
+
+#include "diffusion/frag.cuh"
+#include "diffusion/params.cuh"
+
+#if !CCK_AMD
+#include <cute/tensor.hpp>
+#endif
+
+namespace mk {
+
+constexpr int kBK = 32;      // k per pipeline stage
+constexpr int kStagePad = 4; // floats of padding per staged epilogue row
+// rows staged per epilogue pass; a multiple of a token's 32 gathered rows
+constexpr int kEpiRows = 64;
+constexpr int kLdsPad = 8; // bf16 of padding per portable smem row: conflict-free ldmatrix
+
+// the reference's tile codes, which the harness passes to mk_gemm_test
+enum TileCode : int { T64 = 64, T128 = 256, T128x96 = 296, T96 = 396 };
+struct TileInfo {
+    int code, bm, bn;
+    float speed;
+    bool gathers; // has the portable implementation, which can gather rows
+};
+constexpr int kNumTiles = 4;
+__host__ __device__ constexpr TileInfo tile_info(int i) {
+    switch (i) {
+    case 0:
+        return {T128, 128, 128, 1.0f, true};
+    case 1:
+        return {T128x96, 128, 96, 0.95f, false};
+    case 2:
+        return {T96, 96, 96, 0.9f, false};
+    default:
+        return {T64, 64, 64, 0.55f, true};
+    }
+}
+__host__ __device__ constexpr TileInfo tile_of(int code) {
+    for (int i = 0; i < kNumTiles; i++) {
+        if (tile_info(i).code == code) {
+            return tile_info(i);
+        }
+    }
+    return tile_info(kNumTiles - 1);
+}
+
+__host__ __device__ inline int cdiv(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+// the tile with the fewest whole rounds over the grid, weighted by speed; gathered rows run on the
+// portable tiles, and a GLU tile must hold whole units
+__host__ __device__ inline int choose_tile(int m, int n, int unit, bool gathered, int grid) {
+    int best = T64;
+    float best_cost = 3.4e38f;
+    for (int i = 0; i < kNumTiles; i++) {
+        const TileInfo t = tile_info(i);
+        if (n % t.bn || (unit && t.bn % unit) || (gathered && !t.gathers)) {
+            continue;
+        }
+        const float cost = cdiv(cdiv(m, t.bm) * (n / t.bn), grid) * float(t.bm * t.bn) / t.speed;
+        if (cost < best_cost) {
+            best_cost = cost, best = t.code;
+        }
+    }
+    return best;
+}
+
+__host__ __device__ inline int gemm_tiles(const Gemm& g) {
+    const TileInfo t = tile_of(g.tile);
+    return cdiv(g.m, t.bm) * cdiv(g.n, t.bn);
+}
+
+// a first item past any phase's work: a stopped debug run deals nothing
+constexpr int kIdle = 1 << 28;
+
+// Work dealing: item i of a phase goes to CTA (start + i) mod grid, so consecutive work lists
+// continue the round-robin instead of all starting on CTA 0
+struct Deal {
+    int start = 0;
+    bool live = true;
+    __device__ int first() const {
+        return live ? (int(blockIdx.x) - start + int(gridDim.x)) % int(gridDim.x) : kIdle;
+    }
+    __device__ void advance(int items) {
+        start = (start + items) % int(gridDim.x);
+    }
+};
+
+// the only shared memory: a static __shared__ anywhere would shift it off CuTe's 128-byte swizzle
+__device__ __forceinline__ char* smem_base() {
+    extern __shared__ __align__(128) char smem[];
+    return smem;
+}
+
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.f / (1.f + expf(-x));
+}
+__device__ __forceinline__ float silu(float x) {
+    return x * sigmoid(x);
+}
+__device__ __forceinline__ float4 sigmoid4(float4 v) {
+    return make_float4(sigmoid(v.x), sigmoid(v.y), sigmoid(v.z), sigmoid(v.w));
+}
+__device__ __forceinline__ float4 add4(float4 a, float4 b) {
+    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+__device__ __forceinline__ float4 mul4(float4 a, float4 b) {
+    return make_float4(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w);
+}
+__device__ __forceinline__ float4 ld4(const float* p) {
+    return *reinterpret_cast<const float4*>(p);
+}
+__device__ __forceinline__ void st4(float* p, float4 v) {
+    *reinterpret_cast<float4*>(p) = v;
+}
+__device__ __forceinline__ float4 ldbf4(const bf16* p) {
+    return unpack_bf4(*reinterpret_cast<const uint2*>(p));
+}
+__device__ __forceinline__ void stbf4(bf16* p, float4 v) {
+    *reinterpret_cast<uint2*>(p) = pack_bf4(v);
+}
+
+// ---- epilogues
+
+// Each maps a staged chunk of the accumulator tile: rows row0.. of the GEMM, columns
+// col0..col0+cols, row r of the chunk at st[r * kld]; 4 columns per thread.
+
+template <int kld>
+__device__ void epi_columns(const Gemm& g, const float* st, int row0, int rows, int col0,
+                            int cols) {
+    const int c4s = cols / 4;
+    for (int i = threadIdx.x; i < rows * c4s; i += kThreads) {
+        const int r = i / c4s, c = col0 + 4 * (i % c4s), row = row0 + r;
+        if (row >= g.m || c >= g.n) {
+            continue;
+        }
+        float4 v = ld4(st + r * kld + c - col0);
+        float* outf = static_cast<float*>(g.out) + size_t(row) * g.ldo + c;
+        bf16* outb = static_cast<bf16*>(g.out) + size_t(row) * g.ldo + c;
+        switch (g.epi) {
+        case EPI_STORE:
+            if (g.bias) {
+                v = add4(v, ld4(g.bias + c));
+            }
+            stbf4(outb, c >= g.sig_from ? sigmoid4(v) : v);
+            break;
+        case EPI_QKVG:
+            if (c < g.bias_cols) {
+                v = add4(v, ld4(g.bias + c));
+            }
+            stbf4(outb, c >= g.sig_from ? sigmoid4(v) : v);
+            break;
+        case EPI_F32:
+            st4(outf, g.bias ? add4(v, ld4(g.bias + c)) : v);
+            break;
+        case EPI_SCRES:
+            st4(outf, add4(ld4(outf), v));
+            break;
+        case EPI_RESID: {
+            const int p = row % g.period;
+            const float* in = g.resid ? g.resid + size_t(row) * g.ldo + c : outf;
+            float4 d = mul4(ldbf4(g.gate + size_t(p) * g.n + c), v);
+            if (g.rowmask) {
+                const float m = g.rowmask[p];
+                d = make_float4(d.x * m, d.y * m, d.z * m, d.w * m);
+            }
+            st4(outf, add4(ld4(in), d));
+            break;
+        }
+        case EPI_MODS: {
+            // column c is slot slot0 + (c / kTokC) % slots of block c / (slots kTokC)
+            const int blk = c / (g.slots * kTokC), slot = g.slot0 + (c / kTokC) % g.slots;
+            v = add4(v, ld4(g.bias + c));
+            if (g.sig_slots >> slot & 1) {
+                v = sigmoid4(v);
+            }
+            bf16* o = static_cast<bf16*>(g.out) +
+                      ((size_t(blk) * kTokModSlots + slot) * g.period + row) * kTokC + c % kTokC;
+            stbf4(o, v);
+            break;
+        }
+        }
+    }
+}
+
+// per unit of 64 (or 96) columns: [gate 32 | proj 32 (| a_to_b 32)] -> 32 outputs
+template <int kld>
+__device__ void epi_glu(const Gemm& g, const float* st, int row0, int rows, int col0, int cols) {
+    const int o4s = cols / g.unit * kGluHalf / 4;
+    const bool ab = g.unit > 2 * kGluHalf;
+    for (int i = threadIdx.x; i < rows * o4s; i += kThreads) {
+        const int r = i / o4s, o = 4 * (i % o4s), row = row0 + r;
+        if (row >= g.m) {
+            continue;
+        }
+        const float* s = st + r * kld + (o / kGluHalf) * g.unit + o % kGluHalf;
+        const float4 gate = ld4(s), proj = ld4(s + kGluHalf);
+        float4 v = make_float4(silu(gate.x) * proj.x, silu(gate.y) * proj.y, silu(gate.z) * proj.z,
+                               silu(gate.w) * proj.w);
+        if (ab) {
+            v = mul4(v, ld4(s + 2 * kGluHalf));
+        }
+        const int oc = col0 / g.unit * kGluHalf + o;
+        stbf4(static_cast<bf16*>(g.out) + size_t(row) * g.ldo + oc, v);
+    }
+}
+
+// rows are (token, slot < 32): the masked mean of relu over the 24 real slots, plus SE
+template <int kld>
+__device__ void epi_aggr(const Gemm& g, const float* st, int row0, int rows, int col0, int cols) {
+    constexpr int kGroup = kGluHalf; // gathered rows per token
+    const int c4s = cols / 4;
+    for (int i = threadIdx.x; i < rows / kGroup * c4s; i += kThreads) {
+        const int tk = i / c4s, c = col0 + 4 * (i % c4s), row = (row0 + tk * kGroup) / kGroup;
+        if (row * kGroup >= g.m) {
+            continue;
+        }
+        const int n = row % g.period;
+        float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
+        float wsum = 0.f;
+        for (int j = 0; j < kSlots; j++) {
+            const float w = g.rowmask[n * kSlots + j];
+            const float4 v = ld4(st + (tk * kGroup + j) * kld + c - col0);
+            sum.x += w * fmaxf(v.x, 0.f), sum.y += w * fmaxf(v.y, 0.f);
+            sum.z += w * fmaxf(v.z, 0.f), sum.w += w * fmaxf(v.w, 0.f);
+            wsum += w;
+        }
+        const float inv = 1.f / fmaxf(wsum, 1e-10f);
+        const float4 se = ld4(g.resid + size_t(n) * g.n + c);
+        st4(static_cast<float*>(g.out) + size_t(row) * g.ldo + c,
+            make_float4(sum.x * inv + se.x, sum.y * inv + se.y, sum.z * inv + se.z,
+                        sum.w * inv + se.w));
+    }
+}
+
+// rows are pairs (q, k), column c is table c of the ring group: the folded LN(PC) @ W + b, base 2
+template <int kld>
+__device__ void epi_pair(const Gemm& g, const float* st, int row0, int rows, int col0, int cols) {
+    const int pairs = rows / 2, tiles = g.np / kMma;
+    for (int i = threadIdx.x; i < pairs * cols; i += kThreads) {
+        const int rp = i % pairs, c = col0 + i / pairs, row = row0 + 2 * rp;
+        if (row >= g.m || c >= g.n) {
+            continue;
+        }
+        const int q = row / g.np, k = row % g.np;
+        float v[2];
+        for (int j = 0; j < 2; j++) {
+            const int kk = k + j;
+            if (kk >= g.period || g.tmask[kk] == 0.f) {
+                v[j] = -kMaskBias;
+            } else if (q >= g.period) {
+                v[j] = 0.f;
+            } else {
+                const size_t pq = size_t(q) * g.ldn + kk;
+                const float2 ms = *reinterpret_cast<const float2*>(g.pcs + 2 * pq);
+                const float x = st[(2 * rp + j) * kld + c - col0];
+                v[j] =
+                    ms.y * (x - ms.x * g.plws[c]) + g.plb[c] + (g.plx ? from_bf(g.plx[pq]) : 0.f);
+            }
+        }
+        const int r = q % kMma, cc = k % kMma;
+        bf16* o = static_cast<bf16*>(g.out) +
+                  ((size_t(c) * tiles + q / kMma) * tiles + k / kMma) * (kWarp * kAccVals) +
+                  acc_lane(r, cc) * kAccVals + acc_slot(r, cc);
+        *reinterpret_cast<uint32_t*>(o) = pack_bf2(v[0] * kLog2e, v[1] * kLog2e);
+    }
+}
+
+template <int kld>
+__device__ __forceinline__ void epilogue(const Gemm& g, const float* st, int row0, int rows,
+                                         int col0, int cols) {
+    switch (g.epi) {
+    case EPI_GLU:
+        epi_glu<kld>(g, st, row0, rows, col0, cols);
+        break;
+    case EPI_AGGR:
+        epi_aggr<kld>(g, st, row0, rows, col0, cols);
+        break;
+    case EPI_PAIR:
+        epi_pair<kld>(g, st, row0, rows, col0, cols);
+        break;
+    default:
+        epi_columns<kld>(g, st, row0, rows, col0, cols);
+    }
+}
+
+// ---- portable
+// tile The address of A's row `row`, or null for a zero row
+__device__ __forceinline__ const bf16* a_row(const Gemm& g, int row) {
+    switch (g.gather) {
+    case ROWS_AGGR: {
+        const int tok = row / kGluHalf, slot = row % kGluHalf;
+        if (slot >= kSlots || tok >= g.m / kGluHalf) {
+            return nullptr;
+        }
+        const int s = tok / g.period, n = tok % g.period;
+        const int a = g.q2ta[n * kSlots + slot];
+        return a < 0 ? nullptr : g.a + (size_t(s) * g.atoms + a) * g.lda;
+    }
+    case ROWS_PAIR: {
+        const int q = row / g.np, k = row % g.np;
+        return q < g.period && k < g.period ? g.a + (size_t(q) * g.ldn + k) * g.lda : nullptr;
+    }
+    default:
+        return g.a + size_t(row) * g.lda;
+    }
+}
+
+template <int Code, int STAGES> struct Portable {
+    static constexpr int BM = tile_of(Code).bm, BN = tile_of(Code).bn;
+    static_assert(BM == BN, "each thread copies the same rows of A and W");
+    static constexpr int kLd = kBK + kLdsPad;
+    static constexpr int kCopies = BM * kBK / 8 / kThreads; // 16-byte copies per thread per operand
+    static constexpr int kRowStep = kThreads * 8 / kBK;     // rows between a thread's copies
+    static constexpr int MT = BM / 2 / kMma, NT = BN / 2 / kMma;
+    static constexpr int kSld = BN + kStagePad;
+    static constexpr size_t kSmem = STAGES * (BM + BN) * kLd * sizeof(bf16);
+    static_assert(kSmem >= kEpiRows * kSld * sizeof(float), "staging must fit the pipeline smem");
+};
+
+// a 2x2 grid of warps; each thread copies the same rows of A and of W, sharing one smem offset
+template <int Code, int STAGES>
+__device__ __noinline__ void portable_tiles(const Gemm& gd, int t0, int stride) {
+    using P = Portable<Code, STAGES>;
+    constexpr int BM = P::BM;
+    const Gemm g = gd;
+    char* smem = smem_base();
+    bf16* sa = reinterpret_cast<bf16*>(smem);
+    bf16* sw = sa + STAGES * BM * P::kLd;
+    float* st = reinterpret_cast<float*>(smem);
+    const int warp = threadIdx.x / kWarp, wm = warp % 2, wn = warp / 2;
+    const int crow = threadIdx.x / (kBK / 8), ccol = threadIdx.x % (kBK / 8) * 8;
+    const int mt = cdiv(g.m, BM), tiles = mt * cdiv(g.n, P::BN), ktiles = g.k / kBK;
+    for (int t = t0; t < tiles; t += stride) {
+        const int row0 = t % mt * BM, col0 = t / mt * P::BN;
+        const bf16* ap[P::kCopies];
+        const bf16* wp[P::kCopies];
+        uint32_t aok = 0, wok = 0;
+#pragma unroll
+        for (int i = 0; i < P::kCopies; i++) {
+            const int r = crow + i * P::kRowStep;
+            const bf16* p = a_row(g, row0 + r);
+            aok |= uint32_t(p != nullptr) << i;
+            ap[i] = (p ? p : g.a) + ccol;
+            wok |= uint32_t(col0 + r < g.n) << i;
+            wp[i] = g.w + size_t(col0 + r < g.n ? col0 + r : 0) * g.k + ccol;
+        }
+        Acc acc[P::MT][P::NT];
+#pragma unroll
+        for (int i = 0; i < P::MT; i++) {
+#pragma unroll
+            for (int j = 0; j < P::NT; j++) {
+                acc_zero(acc[i][j]);
+            }
+        }
+        int kload = 0;
+#pragma unroll 1
+        for (int kt = -(STAGES - 1); kt < ktiles; kt++) {
+            if (kt >= 0) {
+                async_wait<STAGES - 2>();
+                __syncthreads();
+            }
+            if (kload < ktiles) {
+                const int slot = kload % STAGES, ko = kload * kBK;
+#pragma unroll
+                for (int i = 0; i < P::kCopies; i++) {
+                    const int off = (slot * BM + crow + i * P::kRowStep) * P::kLd + ccol;
+                    async_copy16(sa + off, ap[i] + ko, aok >> i & 1);
+                    async_copy16(sw + off, wp[i] + ko, wok >> i & 1);
+                }
+            }
+            async_commit();
+            kload++;
+            if (kt < 0) {
+                continue;
+            }
+            const bf16* as = sa + (kt % STAGES) * BM * P::kLd + wm * (BM / 2) * P::kLd;
+            const bf16* ws = sw + (kt % STAGES) * BM * P::kLd + wn * (P::BN / 2) * P::kLd;
+#pragma unroll
+            for (int ks = 0; ks < kBK; ks += kMma) {
+                FragA fa[P::MT];
+                FragB fb[P::NT];
+#pragma unroll
+                for (int i = 0; i < P::MT; i++) {
+                    load_a_lds(fa[i], as + i * kMma * P::kLd + ks, P::kLd);
+                }
+#pragma unroll
+                for (int j = 0; j < P::NT; j++) {
+                    load_b_lds(fb[j], ws + j * kMma * P::kLd + ks, P::kLd);
+                }
+#pragma unroll
+                for (int i = 0; i < P::MT; i++) {
+#pragma unroll
+                    for (int j = 0; j < P::NT; j++) {
+                        mma(acc[i][j], fa[i], fb[j]);
+                    }
+                }
+            }
+        }
+        async_wait<0>();
+        __syncthreads();
+#pragma unroll
+        for (int r0 = 0; r0 < BM; r0 += kEpiRows) {
+#pragma unroll
+            for (int i = 0; i < P::MT; i++) {
+#pragma unroll
+                for (int j = 0; j < P::NT; j++) {
+#pragma unroll
+                    for (int v = 0; v < kAccVals; v++) {
+                        const int r = wm * (BM / 2) + i * kMma + acc_row(v) - r0;
+                        if (r >= 0 && r < kEpiRows) {
+                            st[r * P::kSld + wn * (P::BN / 2) + j * kMma + acc_col(v)] =
+                                acc[i][j].v[v];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            epilogue<P::kSld>(g, st, row0 + r0, kEpiRows, col0, P::BN);
+            __syncthreads();
+        }
+    }
+}
+
+// ---- CuTe tile
+#if !CCK_AMD
+constexpr int kCuteStages = 3;
+
+template <int Code> struct CuteTile {
+    static constexpr int BM = tile_of(Code).bm, BN = tile_of(Code).bn;
+    using T = cute::bfloat16_t;
+    // 8 x 32 atoms, 2-bit swizzle of the 16-byte chunks: conflict-free ldmatrix
+    using Atom = decltype(cute::composition(
+        cute::Swizzle<2, 3, 3>{}, cute::Layout<cute::Shape<cute::_8, cute::Int<kBK>>,
+                                               cute::Stride<cute::Int<kBK>, cute::_1>>{}));
+    using SA = decltype(cute::tile_to_shape(
+        Atom{}, cute::Shape<cute::Int<BM>, cute::Int<kBK>, cute::Int<kCuteStages>>{}));
+    using SB = decltype(cute::tile_to_shape(
+        Atom{}, cute::Shape<cute::Int<BN>, cute::Int<kBK>, cute::Int<kCuteStages>>{}));
+    static constexpr int kSld = BN + kStagePad;
+    static constexpr size_t kSmem = (BM + BN) * kBK * kCuteStages * sizeof(bf16);
+    static_assert(kSmem >= kEpiRows * kSld * sizeof(float), "staging must fit the pipeline smem");
+};
+
+template <int Code> __device__ __noinline__ void cute_tiles(const Gemm& gd, int t0, int stride) {
+    using namespace cute;
+    using C = CuteTile<Code>;
+    constexpr int BM = C::BM, BN = C::BN;
+    using T = typename C::T;
+    const Gemm g = gd;
+    char* smem = smem_base();
+    Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<T*>(smem)), typename C::SA{});
+    Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<T*>(smem) + cosize(typename C::SA{})),
+                            typename C::SB{});
+    float* st = reinterpret_cast<float*>(smem);
+
+    auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, T>{},
+                               Layout<Shape<_32, _4>, Stride<_4, _1>>{}, Layout<Shape<_1, _8>>{});
+    auto mma_t = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<_2, _2, _1>>{},
+                                Tile<_32, _32, _16>{});
+    auto thr_g2s = g2s.get_slice(threadIdx.x);
+    Tensor tAsA = thr_g2s.partition_D(sA);
+    Tensor tBsB = thr_g2s.partition_D(sB);
+    auto thr_mma = mma_t.get_slice(threadIdx.x);
+    Tensor tCrA = thr_mma.partition_fragment_A(sA(_, _, 0));
+    Tensor tCrB = thr_mma.partition_fragment_B(sB(_, _, 0));
+    Tensor acc = partition_fragment_C(mma_t, Shape<Int<BM>, Int<BN>>{});
+    auto s2r_a = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, T>{}, mma_t);
+    auto s2r_b = make_tiled_copy_B(Copy_Atom<SM75_U32x4_LDSM_N, T>{}, mma_t);
+    auto thr_s2r_a = s2r_a.get_slice(threadIdx.x);
+    auto thr_s2r_b = s2r_b.get_slice(threadIdx.x);
+    Tensor tXsA = thr_s2r_a.partition_S(sA);
+    Tensor tXrA = thr_s2r_a.retile_D(tCrA);
+    Tensor tXsB = thr_s2r_b.partition_S(sB);
+    Tensor tXrB = thr_s2r_b.retile_D(tCrB);
+    Tensor tCcC = thr_mma.partition_C(make_identity_tensor(Shape<Int<BM>, Int<BN>>{}));
+    constexpr int kBlocks = size<2>(tCrA);
+
+    const int mt = cdiv(g.m, BM), tiles = mt * cdiv(g.n, BN);
+    for (int t = t0; t < tiles; t += stride) {
+        const int row0 = t % mt * BM, col0 = t / mt * BN;
+        Tensor mA =
+            make_tensor(make_gmem_ptr(reinterpret_cast<const T*>(g.a) + size_t(row0) * g.lda),
+                        make_shape(Int<BM>{}, g.k), make_stride(g.lda, _1{}));
+        Tensor mB = make_tensor(make_gmem_ptr(reinterpret_cast<const T*>(g.w) + size_t(col0) * g.k),
+                                make_shape(Int<BN>{}, g.k), make_stride(g.k, _1{}));
+        Tensor tAgA =
+            thr_g2s.partition_S(local_tile(mA, Shape<Int<BM>, Int<kBK>>{}, make_coord(0, _)));
+        Tensor tBgB =
+            thr_g2s.partition_S(local_tile(mB, Shape<Int<BN>, Int<kBK>>{}, make_coord(0, _)));
+        clear(acc);
+
+        int ktiles = size<3>(tAgA), knext = 0;
+#pragma unroll
+        for (int s = 0; s < kCuteStages - 1; s++) {
+            copy(g2s, tAgA(_, _, _, knext), tAsA(_, _, _, s));
+            copy(g2s, tBgB(_, _, _, knext), tBsB(_, _, _, s));
+            cp_async_fence();
+            if (--ktiles > 0) {
+                knext++;
+            }
+        }
+        int read = 0, write = kCuteStages - 1;
+        cp_async_wait<kCuteStages - 2>();
+        __syncthreads();
+        copy(s2r_a, tXsA(_, _, Int<0>{}, read), tXrA(_, _, Int<0>{}));
+        copy(s2r_b, tXsB(_, _, Int<0>{}, read), tXrB(_, _, Int<0>{}));
+#pragma unroll 1
+        while (ktiles > -(kCuteStages - 1)) {
+#pragma unroll
+            for (int kb = 0; kb < kBlocks; kb++) {
+                if (kb == kBlocks - 1) {
+                    read = read == kCuteStages - 1 ? 0 : read + 1;
+                    cp_async_wait<kCuteStages - 2>();
+                    __syncthreads();
+                }
+                // the next k-block is in registers while this one multiplies
+                const int kn = (kb + 1) % kBlocks;
+                copy(s2r_a, tXsA(_, _, kn, read), tXrA(_, _, kn));
+                copy(s2r_b, tXsB(_, _, kn, read), tXrB(_, _, kn));
+                if (kb == 0) {
+                    copy(g2s, tAgA(_, _, _, knext), tAsA(_, _, _, write));
+                    copy(g2s, tBgB(_, _, _, knext), tBsB(_, _, _, write));
+                    cp_async_fence();
+                    if (--ktiles > 0) {
+                        knext++;
+                    }
+                    write = write == kCuteStages - 1 ? 0 : write + 1;
+                }
+                gemm(mma_t, tCrA(_, _, kb), tCrB(_, _, kb), acc);
+            }
+        }
+        cp_async_wait<0>();
+        __syncthreads();
+#pragma unroll
+        for (int r0 = 0; r0 < BM; r0 += kEpiRows) {
+            const int rows = BM - r0 < kEpiRows ? BM - r0 : kEpiRows;
+#pragma unroll
+            for (int i = 0; i < size(acc); i++) {
+                const int r = get<0>(tCcC(i)) - r0;
+                if (r >= 0 && r < rows) {
+                    st[r * C::kSld + get<1>(tCcC(i))] = acc(i);
+                }
+            }
+            __syncthreads();
+            epilogue<C::kSld>(g, st, row0 + r0, rows, col0, BN);
+            __syncthreads();
+        }
+    }
+}
+#endif
+
+constexpr int kPortableStages128 = 2; // the 128-row portable tile fits 48 KB only with two stages
+constexpr int kPortableStages64 = 3;
+
+// one non-inlined tile loop per GEMM per CTA: a call per tile spilled callee-saved registers
+__device__ inline void gemm_run(const Gemm& g, int t0, int stride) {
+    switch (g.tile) {
+#if !CCK_AMD
+    case T128:
+        if (g.gather == ROWS_PLAIN) {
+            cute_tiles<T128>(g, t0, stride);
+        } else {
+            portable_tiles<T128, kPortableStages128>(g, t0, stride);
+        }
+        break;
+    case T128x96:
+        cute_tiles<T128x96>(g, t0, stride);
+        break;
+    case T96:
+        cute_tiles<T96>(g, t0, stride);
+        break;
+#endif
+    default:
+        portable_tiles<T64, kPortableStages64>(g, t0, stride);
+    }
+}
+
+// deals the GEMMs' tiles over the CTAs, row tiles fastest: co-running CTAs share a weight slice
+template <int N> __device__ void run_gemms(Deal& d, const Gemm* const (&list)[N]) {
+#pragma unroll 1
+    for (int i = 0; i < N; i++) {
+        const int tiles = gemm_tiles(*list[i]);
+        __syncthreads(); // whatever ran before may still read shared memory
+        gemm_run(*list[i], d.first(), gridDim.x);
+        d.advance(tiles);
+    }
+}
+
+constexpr size_t kGemmSmem = CuteTile<T128>::kSmem;
+constexpr int kMaxTileRows = tile_of(T128).bm;
+
+} // namespace mk

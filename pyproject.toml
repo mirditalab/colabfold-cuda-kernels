@@ -1,0 +1,30 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "colabfold-cuda-kernels"
+version = "0.1.0"
+description = "Prebuilt CUDA kernels for ColabFold on Ampere and newer GPUs."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Milot Mirdita", email = "milot@mirdita.de" }]
+keywords = ["alphafold", "colabfold", "cuda", "diffusion", "bioinformatics"]
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Environment :: GPU :: NVIDIA CUDA :: 12",
+]
+
+[project.urls]
+Homepage = "https://github.com/mirditalab/colabfold-cuda-kernels"
+Issues = "https://github.com/mirditalab/colabfold-cuda-kernels/issues"
+
+[tool.scikit-build]
+cmake.source-dir = "src"
+wheel.packages = ["python/colabfold_cuda_kernels"]
+# the library is loaded through ctypes, not imported, so one wheel serves every python
+wheel.py-api = "py3"
