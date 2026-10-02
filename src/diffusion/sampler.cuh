@@ -82,13 +82,13 @@ __device__ __forceinline__ bool resident_pairs() {
 }
 
 // fused adaLN, projections and q/k norms | attention | fused MLP
-__device__ void atom_block(Run& r, const AtomW& w, int b) {
+__device__ void atom_block(Run& r, const AtomW& w, int b, MlpTail tail) {
     Deal d = deal(r);
     atom_proj(d, w, b);
     d = next(r, K_A_QKV);
     atom_attention(d, w, b);
     d = next(r, K_A_ATTN);
-    atom_mlp(d, w, b);
+    atom_mlp(d, w, b, tail);
     next(r, K_A_GLU);
 }
 
@@ -156,12 +156,10 @@ __device__ void denoise(Run& r, float t) {
         if (b < 2) {
             run_gemms(d, {&g.st_w2[b]});
         }
-        atom_mlp(d, enc, b);
+        atom_mlp(d, enc, b, b + 1 < kAtomBlocks ? TAIL_NONE : TAIL_SKIP);
         d = next(r, K_A_GLU);
     }
     // atoms to tokens, the token transformer, tokens back to atoms
-    atom_skip(d);
-    d = next(r, K_AGG);
     run_gemms(d, {&g.aggr});
     next(r, K_AGG);
     for (int b = 0; b < c_kp.nb; b++) {
@@ -175,11 +173,8 @@ __device__ void denoise(Run& r, float t) {
     decoder_init(d);
     next(r, K_DEC_GLUE);
     for (int b = 0; b < kAtomBlocks; b++) {
-        atom_block(r, c_kp.dec, b);
+        atom_block(r, c_kp.dec, b, b + 1 < kAtomBlocks ? TAIL_NONE : TAIL_UPDATE);
     }
-    d = deal(r);
-    atom_update(d);
-    next(r, K_DEC_GLUE);
 }
 
 __device__ void sample(Run& r) {

@@ -243,19 +243,6 @@ __device__ __forceinline__ const bf16* atom_mods(const AtomW& w, int b, int a) {
     return w.amods + (size_t(b) * c_kp.as + a) * kAtomModSlots * kAtomC;
 }
 
-// skip = qa·QMASK, kept in f32 and as bf16 for the aggregation GEMM
-__device__ void atom_skip(Deal& d) {
-    const int rows = c_kp.S * c_kp.A;
-    for (int r = row_first(d); r < rows; r += row_step()) {
-        const float m = c_kp.geo.qmask[r % c_kp.A];
-        Row x = load_row(c_kp.buf.qa + size_t(r) * kAtomC, kAtomC);
-        x.v[0] = make_float4(x.v[0].x * m, x.v[0].y * m, x.v[0].z * m, x.v[0].w * m);
-        store_row(c_kp.buf.skip + size_t(r) * kAtomC, x);
-        store_row_bf(c_kp.buf.abf + size_t(r) * kAtomC, x);
-    }
-    row_done(d, rows);
-}
-
 // qa = (tb[token of a] + skip)·QMASK
 __device__ void decoder_init(Deal& d) {
     const int rows = c_kp.S * c_kp.A;
@@ -269,24 +256,6 @@ __device__ void decoder_init(Deal& d) {
         }
         st4(c_kp.buf.qa + size_t(r) * kAtomC + 4 * lane_id(),
             make_float4(x.x * m, x.y * m, x.z * m, x.w * m));
-    }
-    row_done(d, rows);
-}
-
-// upd = LN(qa·QMASK) @ WUPDᵀ + UPD_B
-__device__ void atom_update(Deal& d) {
-    const int rows = c_kp.S * c_kp.A;
-    for (int r = row_first(d); r < rows; r += row_step()) {
-        const float m = c_kp.geo.qmask[r % c_kp.A];
-        Row x = load_row(c_kp.buf.qa + size_t(r) * kAtomC, kAtomC);
-        x.v[0] = make_float4(x.v[0].x * m, x.v[0].y * m, x.v[0].z * m, x.v[0].w * m);
-        layernorm(x, kLnEps);
-        for (int j = 0; j < kXyz; j++) {
-            const float u = warp_sum(sum4(mul4(x.v[0], col4(c_kp.geo.wupd + j * kAtomC, 0))));
-            if (lane_id() == 0) {
-                c_kp.buf.upd[size_t(r) * kXyz + j] = u + c_kp.geo.upd_b[j];
-            }
-        }
     }
     row_done(d, rows);
 }

@@ -382,8 +382,15 @@ struct MlpStager {
     }
 };
 
+// what the last block of a stack also writes from the new rows, saving a phase that rereads them
+enum MlpTail {
+    TAIL_NONE,
+    TAIL_SKIP,   // the encoder's: skip = qa·QMASK in f32 and as bf16 for the aggregation
+    TAIL_UPDATE, // the decoder's: upd = LN(qa·QMASK) @ WUPDᵀ + UPD_B
+};
+
 // one CTA item: rows row0.. (16 per warp) through the block's attention output and transition
-__device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int rows) {
+__device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int rows, int tail) {
     const int A = c_kp.A, parts = c_kp.flags & ATOB ? kMaxParts : 2;
     const MlpStager stager{w.wo + size_t(b) * kAtomC * kAtomC, w.w1 + size_t(b) * c_kp.aw1 * kAtomC,
                            w.w2 + size_t(b) * kAtomC * kAtomHidden, parts};
@@ -490,17 +497,52 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
         for (int v = 0; v < kAccVals; v += 2) {
             const int c = nt * kMma + acc_col(v), rs = row_slot(v);
             const float2 g = pair_of(am[rs] + AM_T_GATE * kAtomC + c);
+            tin[nt].v[v] += qmask[rs] * g.x * y[nt].v[v];
+            tin[nt].v[v + 1] += qmask[rs] * g.y * y[nt].v[v + 1];
             *reinterpret_cast<float2*>(qa + acc_row(v) * kAtomC + c) =
-                make_float2(tin[nt].v[v] + qmask[rs] * g.x * y[nt].v[v],
-                            tin[nt].v[v + 1] + qmask[rs] * g.y * y[nt].v[v + 1]);
+                make_float2(tin[nt].v[v], tin[nt].v[v + 1]);
+            tin[nt].v[v] *= qmask[rs], tin[nt].v[v + 1] *= qmask[rs];
+        }
+    }
+    if (tail == TAIL_SKIP) {
+        const size_t off = size_t(r0) * kAtomC;
+#pragma unroll
+        for (int nt = 0; nt < kChanT; nt++) {
+#pragma unroll
+            for (int v = 0; v < kAccVals; v += 2) {
+                const int at = acc_row(v) * kAtomC + nt * kMma + acc_col(v);
+                *reinterpret_cast<float2*>(c_kp.buf.skip + off + at) =
+                    make_float2(tin[nt].v[v], tin[nt].v[v + 1]);
+            }
+        }
+        acc_store_bf(tin, c_kp.buf.abf + off, kAtomC, 0);
+    } else if (tail == TAIL_UPDATE) {
+        acc_norm(tin, false, kLnEps);
+        for (int j = 0; j < kXyz; j++) {
+            float u[kRowSlots] = {};
+#pragma unroll
+            for (int nt = 0; nt < kChanT; nt++) {
+#pragma unroll
+                for (int v = 0; v < kAccVals; v++) {
+                    u[row_slot(v)] +=
+                        tin[nt].v[v] * c_kp.geo.wupd[j * kAtomC + nt * kMma + acc_col(v)];
+                }
+            }
+            row_reduce_sum(u);
+            // every lane holding a row writes it: the values agree, and no layout is assumed
+#pragma unroll
+            for (int v = 0; v < kAccVals; v++) {
+                c_kp.buf.upd[size_t(r0 + acc_row(v)) * kXyz + j] =
+                    u[row_slot(v)] + c_kp.geo.upd_b[j];
+            }
         }
     }
 }
 
-__device__ void atom_mlp(Deal& d, const AtomW& w, int b) {
+__device__ void atom_mlp(Deal& d, const AtomW& w, int b, MlpTail tail = TAIL_NONE) {
     const int rows = c_kp.S * c_kp.A, items = cdiv(rows, kAtomRowsItem);
     for (int it = d.first(); it < items; it += gridDim.x) {
-        atom_mlp_item(w, b, it * kAtomRowsItem, rows);
+        atom_mlp_item(w, b, it * kAtomRowsItem, rows, tail);
     }
     d.advance(items);
 }
