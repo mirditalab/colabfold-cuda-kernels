@@ -131,7 +131,7 @@ __host__ __device__ inline Gemm make_gemm(const bf16* a, int lda, const bf16* w,
                                           int k, int epi, void* out, int ldo) {
     Gemm g{};
     g.a = a, g.lda = lda, g.w = w, g.m = m, g.n = n, g.k = k, g.epi = epi, g.out = out, g.ldo = ldo;
-    g.gather = ROWS_PLAIN, g.sig_from = n, g.period = 1;
+    g.gather = ROWS_PLAIN, g.sig_from = n, g.bias_cols = n, g.period = 1;
     return g;
 }
 __device__ inline void pick_tile(Gemm& g, int grid) {

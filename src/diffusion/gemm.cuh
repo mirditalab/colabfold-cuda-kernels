@@ -94,8 +94,9 @@ __device__ __forceinline__ char* smem_base() {
     return smem;
 }
 
+// fast forms: every sigmoid and silu result is rounded to bf16 (a few ulp of f32 do not reach it)
 __device__ __forceinline__ float sigmoid(float x) {
-    return 1.f / (1.f + expf(-x));
+    return __fdividef(1.f, 1.f + __expf(-x));
 }
 __device__ __forceinline__ float silu(float x) {
     return x * sigmoid(x);
@@ -135,38 +136,31 @@ __device__ __forceinline__ void pair_of_row(int row, int np, int& q, int& k) {
 // Each maps a staged chunk of the accumulator tile: rows row0.. of the GEMM, columns
 // col0..col0+cols, row r of the chunk at st[r * kld]; 4 columns per thread.
 
-template <int kld>
-__device__ void epi_columns(const Gemm& g, const float* st, int row0, int rows, int col0,
-                            int cols) {
-    const int c4s = cols / 4;
-    for (int i = threadIdx.x; i < rows * c4s; i += kThreads) {
-        const int r = i / c4s, c = col0 + 4 * (i % c4s), row = row0 + r;
+// one kind per instance: the dispatch is outside the loop, and the chunk width a constant
+template <int E, int kld, int kCols>
+__device__ void epi_columns(const Gemm& g, const float* st, int row0, int rows, int col0) {
+    constexpr int kC4 = kCols / 4;
+    for (int i = threadIdx.x; i < rows * kC4; i += kThreads) {
+        const int r = i / kC4, c = col0 + 4 * (i % kC4), row = row0 + r;
         if (row >= g.m || c >= g.n) {
             continue;
         }
         float4 v = ld4(st + r * kld + c - col0);
         float* outf = static_cast<float*>(g.out) + size_t(row) * g.ldo + c;
         bf16* outb = static_cast<bf16*>(g.out) + size_t(row) * g.ldo + c;
-        switch (g.epi) {
-        case EPI_STORE:
-            if (g.bias) {
+        if constexpr (E == EPI_STORE || E == EPI_QKVG) {
+            if (g.bias && c < g.bias_cols) {
                 v = add4(v, ld4(g.bias + c));
             }
-            stbf4(outb, c >= g.sig_from ? sigmoid4(v) : v);
-            break;
-        case EPI_QKVG:
-            if (c < g.bias_cols) {
-                v = add4(v, ld4(g.bias + c));
+            if (c >= g.sig_from) { // a branch, not a select: only the gate columns pay for it
+                v = sigmoid4(v);
             }
-            stbf4(outb, c >= g.sig_from ? sigmoid4(v) : v);
-            break;
-        case EPI_F32:
+            stbf4(outb, v);
+        } else if constexpr (E == EPI_F32) {
             st4(outf, g.bias ? add4(v, ld4(g.bias + c)) : v);
-            break;
-        case EPI_SCRES:
+        } else if constexpr (E == EPI_SCRES) {
             st4(outf, add4(ld4(outf), v));
-            break;
-        case EPI_RESID: {
+        } else if constexpr (E == EPI_RESID) {
             const int p = row % g.period;
             const float* in = g.resid ? g.resid + size_t(row) * g.ldo + c : outf;
             float4 d = mul4(ldbf4(g.gate + size_t(p) * g.n + c), v);
@@ -175,10 +169,8 @@ __device__ void epi_columns(const Gemm& g, const float* st, int row0, int rows, 
                 d = make_float4(d.x * m, d.y * m, d.z * m, d.w * m);
             }
             st4(outf, add4(ld4(in), d));
-            break;
-        }
-        case EPI_MODS: {
-            // column c is slot slot0 + (c / kTokC) % slots of block c / (slots kTokC)
+        } else {
+            // MODS: column c is slot slot0 + (c / kTokC) % slots of block c / (slots kTokC)
             const int blk = c / (g.slots * kTokC), slot = g.slot0 + (c / kTokC) % g.slots;
             v = add4(v, ld4(g.bias + c));
             if (g.sig_slots >> slot & 1) {
@@ -187,8 +179,6 @@ __device__ void epi_columns(const Gemm& g, const float* st, int row0, int rows, 
             bf16* o = static_cast<bf16*>(g.out) +
                       ((size_t(blk) * kTokModSlots + slot) * g.period + row) * kTokC + c % kTokC;
             stbf4(o, v);
-            break;
-        }
         }
     }
 }
@@ -282,21 +272,33 @@ __device__ void epi_pair(const Gemm& g, const float* st, int row0, int rows, int
     }
 }
 
-template <int kld>
+template <int kld, int kCols>
 __device__ __forceinline__ void epilogue(const Gemm& g, const float* st, int row0, int rows,
-                                         int col0, int cols) {
+                                         int col0) {
     switch (g.epi) {
     case EPI_GLU:
-        epi_glu<kld>(g, st, row0, rows, col0, cols);
+        epi_glu<kld>(g, st, row0, rows, col0, kCols);
         break;
     case EPI_AGGR:
-        epi_aggr<kld>(g, st, row0, rows, col0, cols);
+        epi_aggr<kld>(g, st, row0, rows, col0, kCols);
         break;
     case EPI_PAIR:
-        epi_pair<kld>(g, st, row0, rows, col0, cols);
+        epi_pair<kld>(g, st, row0, rows, col0, kCols);
+        break;
+    case EPI_F32:
+        epi_columns<EPI_F32, kld, kCols>(g, st, row0, rows, col0);
+        break;
+    case EPI_SCRES:
+        epi_columns<EPI_SCRES, kld, kCols>(g, st, row0, rows, col0);
+        break;
+    case EPI_RESID:
+        epi_columns<EPI_RESID, kld, kCols>(g, st, row0, rows, col0);
+        break;
+    case EPI_MODS:
+        epi_columns<EPI_MODS, kld, kCols>(g, st, row0, rows, col0);
         break;
     default:
-        epi_columns<kld>(g, st, row0, rows, col0, cols);
+        epi_columns<EPI_QKVG, kld, kCols>(g, st, row0, rows, col0);
     }
 }
 
@@ -434,7 +436,7 @@ __device__ __noinline__ void portable_tiles(const Gemm& gd, int t0, int stride) 
                 }
             }
             __syncthreads();
-            epilogue<P::kSld>(g, st, row0 + r0, kEpiRows, col0, P::BN);
+            epilogue<P::kSld, P::BN>(g, st, row0 + r0, kEpiRows, col0);
             __syncthreads();
         }
     }
@@ -561,7 +563,7 @@ template <int Code> __device__ __noinline__ void cute_tiles(const Gemm& gd, int 
                 }
             }
             __syncthreads();
-            epilogue<C::kSld>(g, st, row0 + r0, rows, col0, BN);
+            epilogue<C::kSld, BN>(g, st, row0 + r0, rows, col0);
             __syncthreads();
         }
     }
