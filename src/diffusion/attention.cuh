@@ -6,8 +6,6 @@
 
 namespace mk {
 
-constexpr int kTileVals = kWarp * kAccVals; // values per swizzled 16x16 tile
-
 // Online softmax state for the rows of R query tiles
 template <int R> struct Softmax {
     float m[R][kRowSlots], l[R][kRowSlots];

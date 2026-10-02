@@ -122,6 +122,14 @@ __device__ __forceinline__ void stbf4(bf16* p, float4 v) {
     *reinterpret_cast<uint2*>(p) = pack_bf4(v);
 }
 
+// the pair (q, k) of row R of the pair-logit GEMM: tile R / 256 of the NP x NP table, then its
+// swizzled [lane][value] order
+__device__ __forceinline__ void pair_of_row(int row, int np, int& q, int& k) {
+    const int tiles = np / kMma, t = row / kTileVals, w = row % kTileVals;
+    q = t / tiles * kMma + acc_row_of(w / kAccVals, w % kAccVals);
+    k = t % tiles * kMma + acc_col_of(w / kAccVals, w % kAccVals);
+}
+
 // ---- epilogues
 
 // Each maps a staged chunk of the accumulator tile: rows row0.. of the GEMM, columns
@@ -235,36 +243,42 @@ __device__ void epi_aggr(const Gemm& g, const float* st, int row0, int rows, int
     }
 }
 
-// rows are pairs (q, k), column c is table c of the ring group: the folded LN(PC) @ W + b, base 2
+// rows are pairs (q, k) in the swizzled table's own order, so row R is element R of every table;
+// column c is table c of the ring group: the folded LN(PC) @ W + b, in base 2. A thread keeps two
+// rows' terms and walks the columns; a warp's lanes store consecutive row pairs.
 template <int kld>
 __device__ void epi_pair(const Gemm& g, const float* st, int row0, int rows, int col0, int cols) {
-    const int pairs = rows / 2, tiles = g.np / kMma;
-    for (int i = threadIdx.x; i < pairs * cols; i += kThreads) {
-        const int rp = i % pairs, c = col0 + i / pairs, row = row0 + 2 * rp;
-        if (row >= g.m || c >= g.n) {
-            continue;
+    const int pairs = rows / 2, rp = threadIdx.x % pairs, row = row0 + 2 * rp;
+    if (row >= g.m) {
+        return;
+    }
+    int q, k; // rows 2rp and 2rp + 1 are keys k and k + 1 of query q
+    pair_of_row(row, g.np, q, k);
+    float mean[2], rstd[2], extra[2];
+    bool masked[2], pad[2];
+    for (int j = 0; j < 2; j++) {
+        const int kk = k + j;
+        masked[j] = kk >= g.period || g.tmask[kk] == 0.f;
+        pad[j] = q >= g.period;
+        mean[j] = rstd[j] = extra[j] = 0.f;
+        if (!masked[j] && !pad[j]) {
+            const size_t pq = size_t(q) * g.ldn + kk;
+            mean[j] = g.pcs[2 * pq], rstd[j] = g.pcs[2 * pq + 1];
+            extra[j] = g.plx ? from_bf(g.plx[pq]) : 0.f;
         }
-        const int q = row / g.np, k = row % g.np;
+    }
+    const size_t plane = size_t(g.np) * g.np;
+    bf16* out = static_cast<bf16*>(g.out) + row;
+    for (int c = threadIdx.x / pairs; c < cols && col0 + c < g.n; c += kThreads / pairs) {
+        const int col = col0 + c;
         float v[2];
         for (int j = 0; j < 2; j++) {
-            const int kk = k + j;
-            if (kk >= g.period || g.tmask[kk] == 0.f) {
-                v[j] = -kMaskBias;
-            } else if (q >= g.period) {
-                v[j] = 0.f;
-            } else {
-                const size_t pq = size_t(q) * g.ldn + kk;
-                const float2 ms = *reinterpret_cast<const float2*>(g.pcs + 2 * pq);
-                const float x = st[(2 * rp + j) * kld + c - col0];
-                v[j] =
-                    ms.y * (x - ms.x * g.plws[c]) + g.plb[c] + (g.plx ? from_bf(g.plx[pq]) : 0.f);
-            }
+            const float x = st[(2 * rp + j) * kld + c];
+            v[j] = masked[j] ? -kMaskBias
+                   : pad[j]  ? 0.f
+                             : rstd[j] * (x - mean[j] * g.plws[col]) + g.plb[col] + extra[j];
         }
-        const int r = q % kMma, cc = k % kMma;
-        bf16* o = static_cast<bf16*>(g.out) +
-                  ((size_t(c) * tiles + q / kMma) * tiles + k / kMma) * (kWarp * kAccVals) +
-                  acc_lane(r, cc) * kAccVals + acc_slot(r, cc);
-        *reinterpret_cast<uint32_t*>(o) = pack_bf2(v[0] * kLog2e, v[1] * kLog2e);
+        *reinterpret_cast<uint32_t*>(out + col * plane) = pack_bf2(v[0] * kLog2e, v[1] * kLog2e);
     }
 }
 
@@ -286,8 +300,9 @@ __device__ __forceinline__ void epilogue(const Gemm& g, const float* st, int row
     }
 }
 
-// ---- portable
-// tile The address of A's row `row`, or null for a zero row
+// ---- portable tile
+
+// the address of A's row `row`, or null for a zero row
 __device__ __forceinline__ const bf16* a_row(const Gemm& g, int row) {
     switch (g.gather) {
     case ROWS_AGGR: {
@@ -300,7 +315,8 @@ __device__ __forceinline__ const bf16* a_row(const Gemm& g, int row) {
         return a < 0 ? nullptr : g.a + (size_t(s) * g.atoms + a) * g.lda;
     }
     case ROWS_PAIR: {
-        const int q = row / g.np, k = row % g.np;
+        int q, k;
+        pair_of_row(row, g.np, q, k);
         return q < g.period && k < g.period ? g.a + (size_t(q) * g.ldn + k) * g.lda : nullptr;
     }
     default:

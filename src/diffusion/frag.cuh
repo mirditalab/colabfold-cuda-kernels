@@ -16,8 +16,9 @@
 
 namespace mk {
 
-constexpr int kMma = 16;    // tile edge of one product
-constexpr int kAccVals = 8; // accumulator values per lane
+constexpr int kMma = 16;                    // tile edge of one product
+constexpr int kAccVals = 8;                 // accumulator values per lane
+constexpr int kTileVals = kWarp * kAccVals; // values per 16x16 tile, swizzled as [lane][value]
 
 struct Acc {
     float v[kAccVals];
@@ -60,12 +61,18 @@ __device__ __forceinline__ float4 unpack_bf4(uint2 u) {
 
 constexpr int kRowSlots = 2; // distinct accumulator rows per lane
 
-// value i of this lane sits at (acc_row(i), acc_col(i)) of the tile
+// value i of lane l sits at (acc_row_of(l, i), acc_col_of(l, i)) of the tile
+__host__ __device__ __forceinline__ int acc_row_of(int l, int i) {
+    return l / 4 + 8 * ((i >> 1) & 1);
+}
+__host__ __device__ __forceinline__ int acc_col_of(int l, int i) {
+    return 8 * (i >> 2) + 2 * (l % 4) + (i & 1);
+}
 __device__ __forceinline__ int acc_row(int i) {
-    return lane_id() / 4 + 8 * ((i >> 1) & 1);
+    return acc_row_of(lane_id(), i);
 }
 __device__ __forceinline__ int acc_col(int i) {
-    return 8 * (i >> 2) + 2 * (lane_id() % 4) + (i & 1);
+    return acc_col_of(lane_id(), i);
 }
 // which of the lane's rows value i belongs to
 __host__ __device__ constexpr int row_slot(int i) {
