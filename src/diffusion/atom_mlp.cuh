@@ -327,7 +327,7 @@ __device__ __noinline__ void atom_proj_item(const AtomW& w, int b, int row0, int
                                 ring_elems(atom_parts()) / kPieceElems};
     bf16* tile = atom_rows_tile();
     ring.start();
-    const bf16* am[kRowSlots];
+    const float* am[kRowSlots];
     const float* rope[kRowSlots];
     for (int i = 0; i < kAccVals; i++) {
         const int a = (r0 + acc_row(i)) % A;
@@ -342,7 +342,7 @@ __device__ __noinline__ void atom_proj_item(const AtomW& w, int b, int row0, int
         Acc x[kChanT], y[kChanT];
         acc_load(x, c_kp.buf.qa + size_t(r0) * kAtomC);
         acc_norm(x, esm, c_kp.atom_eps);
-        const bf16 *qs[kRowSlots], *qb[kRowSlots];
+        const float *qs[kRowSlots], *qb[kRowSlots];
         rows_at(qs, am, AM_Q_SCALE * kAtomC), rows_at(qb, am, AM_Q_BIAS * kAtomC);
         acc_affine(y, x, qs, qb);
         acc_to_a_all(aq, y, tile);
@@ -356,7 +356,7 @@ __device__ __noinline__ void atom_proj_item(const AtomW& w, int b, int row0, int
             }
             acc_norm(x, esm, c_kp.atom_eps);
         }
-        const bf16 *ks[kRowSlots], *kb[kRowSlots];
+        const float *ks[kRowSlots], *kb[kRowSlots];
         rows_at(ks, am, AM_K_SCALE * kAtomC), rows_at(kb, am, AM_K_BIAS * kAtomC);
         acc_affine(y, x, ks, kb);
         acc_to_a_all(ak, y, tile);
@@ -453,7 +453,7 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
     const int r0 = row0 + warp_id() * kMma;
     const bool active = r0 < rows; // every warp keeps to the barriers
     float* qa = c_kp.buf.qa + size_t(active ? r0 : 0) * kAtomC;
-    const bf16* am[kRowSlots];
+    const float* am[kRowSlots];
     float qmask[kRowSlots];
     for (int i = 0; i < kAccVals; i++) {
         const int a = ((active ? r0 : 0) + acc_row(i)) % A;
@@ -463,7 +463,8 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
     ring.start();
 
     // 1. T = AO·WOᵀ, 32 output channels per stage
-    FragA a[kChanT]; // AO, then the transition's input
+    FragA a[kChanT];    // AO, then the transition's input
+    FragA a_lo[kChanT]; // the transition input's low part: AF3 runs the atom transformers in f32
     Acc x[kChanT];
 #pragma unroll
     for (int kt = 0; kt < kChanT; kt++) {
@@ -497,19 +498,22 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
             for (int v = 0; v < kAccVals; v += kAdj) {
                 const int c = nt * kMma + acc_col(v);
                 const Adj<float> in = adj(qa + acc_row(v) * kAtomC + c);
-                const Adj<bf16> g = adj(am[row_slot(v)] + AM_ATTN_GATE * kAtomC + c);
+                const Adj<float> g = adj(am[row_slot(v)] + AM_ATTN_GATE * kAtomC + c);
 #pragma unroll
                 for (int j = 0; j < kAdj; j++) {
-                    tin[nt].v[v + j] = in.v[j] + from_bf(g.v[j]) * x[nt].v[v + j];
+                    tin[nt].v[v + j] = in.v[j] + g.v[j] * x[nt].v[v + j];
                     x[nt].v[v + j] = parallel ? in.v[j] : tin[nt].v[v + j];
                 }
             }
         }
         acc_norm(x, c_kp.flags & ESM, c_kp.atom_eps);
-        const bf16 *ts[kRowSlots], *tb[kRowSlots];
+        const float *ts[kRowSlots], *tb[kRowSlots];
         rows_at(ts, am, AM_T_SCALE * kAtomC), rows_at(tb, am, AM_T_BIAS * kAtomC);
         acc_affine(x, x, ts, tb);
-        acc_to_a_all(a, x, tile);
+#pragma unroll
+        for (int kt = 0; kt < kChanT; kt++) {
+            acc_to_a_split(x[kt], a[kt], a_lo[kt], tile);
+        }
     }
 
     // 3. per half-unit: [gate | proj (| a_to_b)] = x·W1ᵀ, c = silu(gate)·proj(·a_to_b), y += c·W2ᵀ
@@ -527,7 +531,9 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
         Acc g[1], p[1];
         acc_zero(g[0]), acc_zero(p[0]);
         warp_gemm_lds(g, a, st, kW1Ld);
+        warp_gemm_lds(g, a_lo, st, kW1Ld);
         warp_gemm_lds(p, a, st + kHalfUnit * kW1Ld, kW1Ld);
+        warp_gemm_lds(p, a_lo, st + kHalfUnit * kW1Ld, kW1Ld);
 #pragma unroll
         for (int v = 0; v < kAccVals; v++) {
             p[0].v[v] *= silu(g[0].v[v]);
@@ -535,6 +541,7 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
         if (parts == kMaxParts) {
             acc_zero(g[0]);
             warp_gemm_lds(g, a, st + 2 * kHalfUnit * kW1Ld, kW1Ld);
+            warp_gemm_lds(g, a_lo, st + 2 * kHalfUnit * kW1Ld, kW1Ld);
 #pragma unroll
             for (int v = 0; v < kAccVals; v++) {
                 p[0].v[v] *= g[0].v[v];
@@ -554,11 +561,11 @@ __device__ __noinline__ void atom_mlp_item(const AtomW& w, int b, int row0, int 
 #pragma unroll
         for (int v = 0; v < kAccVals; v += kAdj) {
             const int c = nt * kMma + acc_col(v), rs = row_slot(v);
-            const Adj<bf16> g = adj(am[rs] + AM_T_GATE * kAtomC + c);
+            const Adj<float> g = adj(am[rs] + AM_T_GATE * kAtomC + c);
             Adj<float> out;
 #pragma unroll
             for (int j = 0; j < kAdj; j++) {
-                tin[nt].v[v + j] += qmask[rs] * from_bf(g.v[j]) * y[nt].v[v + j];
+                tin[nt].v[v + j] += qmask[rs] * g.v[j] * y[nt].v[v + j];
                 out.v[j] = tin[nt].v[v + j];
                 tin[nt].v[v + j] *= qmask[rs];
             }

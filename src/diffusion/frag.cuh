@@ -364,6 +364,18 @@ __device__ __forceinline__ void row_reduce_sum(float (&v)[kRowSlots]) {
 __device__ __forceinline__ int acc_row(int i) {
     return acc_row_of(lane_id(), i);
 }
+
+// an accumulator as two A operands whose sum carries its f32 value to ~16 bits: a product over both
+// keeps an f32 input's precision where AlphaFold 3 runs the layer in f32
+__device__ __forceinline__ void acc_to_a_split(const Acc& c, FragA& hi, FragA& lo, bf16* tile) {
+    Acc r;
+#pragma unroll
+    for (int i = 0; i < kAccVals; i++) {
+        r.v[i] = c.v[i] - from_bf(to_bf(c.v[i]));
+    }
+    hi = acc_to_a(c, tile);
+    lo = acc_to_a(r, tile);
+}
 __device__ __forceinline__ int acc_col(int i) {
     return acc_col_of(lane_id(), i);
 }

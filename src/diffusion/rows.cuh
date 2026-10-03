@@ -239,7 +239,7 @@ __device__ void sc_prep(Deal& d) {
 
 // ---- atom rows
 
-__device__ __forceinline__ const bf16* atom_mods(const AtomW& w, int b, int a) {
+__device__ __forceinline__ const float* atom_mods(const AtomW& w, int b, int a) {
     return w.amods + (size_t(b) * c_kp.as + a) * kAtomModSlots * kAtomC;
 }
 

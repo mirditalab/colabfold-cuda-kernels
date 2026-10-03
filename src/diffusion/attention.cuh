@@ -84,7 +84,13 @@ __device__ __forceinline__ void store_gated(const Acc& o, const float (&l)[kRowS
     }
 }
 
-// a lane's 8 values of a swizzled bias tile, one 16-byte load
+// a lane's 8 values of a swizzled f32 bias tile (the atom pair logits: AF3 keeps the atom path f32)
+__device__ __forceinline__ void bias_tile(const float* tile, float (&v)[kAccVals]) {
+    const float4* p = reinterpret_cast<const float4*>(tile + lane_id() * kAccVals);
+    const float4 a = p[0], b = p[1];
+    v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+}
+// a lane's 8 values of a swizzled bf16 bias tile, one 16-byte load
 __device__ __forceinline__ void bias_tile(const bf16* tile, float (&v)[kAccVals]) {
     const uint4 u = *reinterpret_cast<const uint4*>(tile + lane_id() * kAccVals);
     const uint32_t w[4] = {u.x, u.y, u.z, u.w};
@@ -314,7 +320,7 @@ __device__ __noinline__ void atom_attention_item(const AtomW& w, int b, int u, i
     const bf16* akv = c_kp.buf.akv + size_t(s) * A * 2 * kAtomC + h * kAtomHeadD;
     const int* q2k = c_kp.geo.q2k + u * NK;
     const float* kmask = c_kp.geo.kmask + u * NK;
-    const bf16* apl =
+    const float* apl =
         w.apl + ((size_t(b) * c_kp.nss + u) * kAtomHeads + h) * kAtomQT * (NK / kMma) * kTileVals;
 
     FragA fq[kAtomQT][kAtomDT];

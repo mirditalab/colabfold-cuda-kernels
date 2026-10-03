@@ -322,7 +322,7 @@ static KP make_kp(const Template& t, const void* const* in, char* ws, float* out
     for (int side = 0; side < 2; side++) {
         AtomW& a = side ? p.dec : p.enc;
         const int in0 = side ? DEC_AMODS : ENC_AMODS; // AMODS, APL, WQG, BQ, WKV, WO, W1, W2
-        a.amods = x.h(in0), a.apl = x.h(in0 + 1), a.wqg = x.h(in0 + 2), a.bq = x.f(in0 + 3);
+        a.amods = x.f(in0), a.apl = x.f(in0 + 1), a.wqg = x.h(in0 + 2), a.bq = x.f(in0 + 3);
         a.wkv = x.h(in0 + 4), a.wo = x.h(in0 + 5), a.w1 = x.h(in0 + 6), a.w2 = x.h(in0 + 7);
         a.qkn = x.f(side ? DQKN : EQKN);
     }
@@ -469,6 +469,12 @@ extern "C" const char* mk_timing_names() {
     static const char names[] = MK_KINDS(MK_NAME);
 #undef MK_NAME
     return names;
+}
+
+// the input contract's version: 2 has the atom adaLN modulations and pair logits (ENC/DEC_AMODS,
+// ENC/DEC_APL) in f32, not bf16
+extern "C" int mk_version() {
+    return 2;
 }
 
 extern "C" int mk_buf_id(const char* name) {

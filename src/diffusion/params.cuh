@@ -62,8 +62,8 @@ struct TokenW {
 };
 
 struct AtomW {
-    const bf16 *amods, *apl, *wqg, *wkv, *wo, *w1, *w2;
-    const float *bq, *qkn;
+    const bf16 *wqg, *wkv, *wo, *w1, *w2;
+    const float *amods, *apl, *bq, *qkn; // amods, apl: f32 as AF3's atom path
 };
 
 struct Geo {
