@@ -39,16 +39,18 @@ jobs:
           mkdir -p build
           cp -r "$(python -c 'import jax; print(jax.ffi.include_dir())')" build/ffi-include
 
-      - name: Build wheel in CUDA 12.9
+      - name: Build wheel
         run: |
           docker run --rm -v "$PWD":/io -w /io \
             -e SKBUILD_CMAKE_DEFINE="CCK_FFI_INCLUDE_DIR=/io/build/ffi-include" \
-            -e CUDACXX=/usr/local/cuda/bin/nvcc \
+            -e CUDACXX=/usr/local/cuda/bin/nvcc -e HOST_IDS="$(id -u):$(id -g)" \
             "${{ matrix.cuda_image }}" bash -euo pipefail -c '
               # Install the static libstdc++ to make the library independent.
               dnf install -y -q python3.11 python3.11-pip libstdc++-static git
               python3.11 -m pip install -q build
               python3.11 -m build --wheel
+              # the container runs as root; hand the outputs back so later steps can rewrite them
+              chown -R "$HOST_IDS" dist build
             '
 
       - name: Audit shared library
