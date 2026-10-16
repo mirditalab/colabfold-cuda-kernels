@@ -8,9 +8,16 @@
 #define CCK_AMD 1
 #else
 #define CCK_AMD 0
-// HIP's unsynchronised warp shuffle, as a full-warp synchronised one
-#define __shfl_xor(v, o, w) __shfl_xor_sync(0xffffffffu, v, o, w)
 #endif
+
+// a full-warp xor shuffle: HIP's unsynchronised one, CUDA's synchronised one
+template <typename T> __device__ __forceinline__ T shfl_xor(T v, int o, int w) {
+#if CCK_AMD
+    return __shfl_xor(v, o, w);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, o, w);
+#endif
+}
 
 namespace cg = cooperative_groups;
 

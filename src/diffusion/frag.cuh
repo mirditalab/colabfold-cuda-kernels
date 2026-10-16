@@ -203,7 +203,7 @@ template <int N> __device__ __forceinline__ void async_wait() {
 
 // v of the lane O apart among those sharing a row
 template <int O> __device__ __forceinline__ float row_xor(float v) {
-    return __shfl_xor(v, O, kWarp);
+    return shfl_xor(v, O, kWarp);
 }
 
 // base-2 exponent without denormals: the instruction __expf ends in

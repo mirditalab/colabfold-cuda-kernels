@@ -16,7 +16,7 @@ __device__ __forceinline__ int warp_id() {
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = kWarp / 2; o; o /= 2) {
-        v += __shfl_xor(v, o, kWarp);
+        v += shfl_xor(v, o, kWarp);
     }
     return v;
 }
