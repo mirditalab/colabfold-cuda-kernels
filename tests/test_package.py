@@ -14,6 +14,12 @@ def test_diffusion_needs_ampere():
     assert not cck.available(75)
 
 
+def test_fp8_contract_needs_ada():
+    assert cck.symbol("fp8_contract", 89) == "CckFp8Contract"
+    with pytest.raises(FileNotFoundError):
+        cck.symbol("fp8_contract", 86)
+
+
 def test_unknown_kernel():
     with pytest.raises(KeyError):
         cck.library_path("nope", 120)
@@ -27,4 +33,5 @@ def test_library_exports_every_symbol(cc):
     assert os.path.basename(path) == "libcolabfold_cuda_kernels.so"
     lib = ctypes.cdll.LoadLibrary(path)
     for kernel in cck.KERNELS:
-        getattr(lib, cck.symbol(kernel, cc))
+        if cck.available(cc, kernel):
+            getattr(lib, cck.symbol(kernel, cc))

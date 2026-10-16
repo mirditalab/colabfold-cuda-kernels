@@ -1,8 +1,9 @@
 # colabfold-cuda-kernels
 
 Prebuilt CUDA kernels to make ColabFold fast on Ampere and newer NVIDIA GPUs.
-This package has one kernel so far: the AF3-family diffusion sampler, which
-runs every step and every sample of a fold in a single launch.
+This package has two kernels so far: the AF3-family diffusion sampler, which
+runs every step and every sample of a fold in a single launch, and the triangle
+multiplication's FP8 contraction for sm_89 and newer, through cuBLASLt.
 
 ```python
 import colabfold_cuda_kernels as cck

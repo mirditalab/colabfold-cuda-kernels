@@ -35,6 +35,10 @@ message(STATUS "cck: XLA FFI headers ${CCK_FFI_INCLUDE_DIR} (api ${ffi_api})")
 
 set(CCK_SOURCES diffusion/diffusion.cu)
 set_source_files_properties(${CCK_SOURCES} PROPERTIES LANGUAGE ${CCK_GPU_LANGUAGE})
+if(NOT ENABLE_HIP)
+    # the FP8 triangle contraction through cuBLASLt, CUDA only; host code, so no pass per architecture
+    list(APPEND CCK_SOURCES contract/fp8_contract.cpp)
+endif()
 
 add_library(colabfold_cuda_kernels SHARED ${CCK_SOURCES})
 target_include_directories(colabfold_cuda_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CCK_FFI_INCLUDE_DIR})
@@ -73,6 +77,9 @@ else()
     # the library links to the C library only (a HIP build that does this segfaults on load into python)
     target_link_options(colabfold_cuda_kernels PRIVATE -static-libstdc++ -static-libgcc)
     target_include_directories(colabfold_cuda_kernels PRIVATE "${CUTLASS_DIR}/include")
+    # cuBLASLt's header only: the library is opened at run time, the one jax loaded
+    target_include_directories(colabfold_cuda_kernels PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(colabfold_cuda_kernels PRIVATE ${CMAKE_DL_LIBS})
     target_compile_options(colabfold_cuda_kernels PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-diag-suppress=177,1556;--threads=0;${CCK_GENCODE}>
     )

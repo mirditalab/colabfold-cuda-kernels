@@ -17,6 +17,7 @@ _LIBRARY = Path(__file__).resolve().parent / "libcolabfold_cuda_kernels.so"
 # kernel: (minimum compute capability, XLA FFI target name)
 _TABLE = {
     "diffusion": (80, "MkSample"),
+    "fp8_contract": (89, "CckFp8Contract"),
 }
 
 KERNELS = tuple(_TABLE)
