@@ -61,7 +61,14 @@ __host__ __device__ __forceinline__ float from_bf(uint32_t b) {
     return x;
 }
 __device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
+#if CCK_AMD
     return to_bf(lo) | (to_bf(hi) << 16);
+#else
+    const __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi); // one cvt, rounded as to_bf
+    uint32_t u;
+    memcpy(&u, &h, sizeof u);
+    return u;
+#endif
 }
 __device__ __forceinline__ uint2 pack_bf4(float4 v) {
     return make_uint2(pack_bf2(v.x, v.y), pack_bf2(v.z, v.w));
