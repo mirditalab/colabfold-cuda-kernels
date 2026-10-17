@@ -9,7 +9,7 @@ __all__ = [
     "symbol",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # One library for every architecture: SASS per built one, PTX for later GPUs.
 _LIBRARY = Path(__file__).resolve().parent / "libcolabfold_cuda_kernels.so"
