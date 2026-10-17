@@ -101,12 +101,28 @@ __device__ __forceinline__ char* smem_base() {
 }
 
 // fast forms: every sigmoid and silu result is rounded to bf16 (a few ulp of f32 do not reach it)
+#if CCK_AMD
 __device__ __forceinline__ float sigmoid(float x) {
     return __fdividef(1.f, 1.f + __expf(-x));
 }
 __device__ __forceinline__ float silu(float x) {
     return x * sigmoid(x);
 }
+#else
+// one MUFU.TANH instead of an ex2 and a reciprocal: sigmoid(x) = (1 + tanh(x / 2)) / 2
+__device__ __forceinline__ float tanh_approx(float x) {
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ float sigmoid(float x) {
+    return fmaf(0.5f, tanh_approx(0.5f * x), 0.5f);
+}
+__device__ __forceinline__ float silu(float x) {
+    const float h = 0.5f * x;
+    return fmaf(h, tanh_approx(h), h);
+}
+#endif
 __device__ __forceinline__ float4 sigmoid4(float4 v) {
     return make_float4(sigmoid(v.x), sigmoid(v.y), sigmoid(v.z), sigmoid(v.w));
 }
