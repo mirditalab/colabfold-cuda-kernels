@@ -267,16 +267,14 @@ __device__ void epi_pair(const Gemm& g, const float* st, int row0, int rows, int
     bf16* out = static_cast<bf16*>(g.out) + row;
     for (int c = threadIdx.x / pairs; c < cols && col0 + c < g.n; c += kThreads / pairs) {
         const int col = col0 + c;
-        Adj<bf16> v;
+        float y[kAdj];
         for (int j = 0; j < kAdj; j++) {
             const float x = st[(kAdj * rp + j) * kld + c];
-            const float y = masked[j] ? -kMaskBias
-                            : pad[j]
-                                ? 0.f
-                                : rstd[j] * (x - mean[j] * g.plws[col]) + g.plb[col] + extra[j];
-            v.v[j] = bf16(to_bf(y * kLog2e));
+            y[j] = kLog2e * (masked[j] ? -kMaskBias
+                             : pad[j]  ? 0.f
+                                       : rstd[j] * (x - mean[j] * g.plws[col]) + g.plb[col] + extra[j]);
         }
-        adj(out + col * plane) = v;
+        adj(out + col * plane) = adj_bf(y);
     }
 }
 

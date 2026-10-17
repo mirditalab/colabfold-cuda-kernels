@@ -82,6 +82,27 @@ template <class T> __device__ __forceinline__ const Adj<T>& adj(const T* p) {
     return *reinterpret_cast<const Adj<T>*>(p);
 }
 
+// kAdj values as bf16 side by side, rounded as to_bf: one cvt per pair on NVIDIA
+__device__ __forceinline__ Adj<bf16> adj_bf(const float (&x)[kAdj]) {
+    Adj<bf16> v;
+#if CCK_AMD
+    v.v[0] = bf16(to_bf(x[0]));
+#else
+    const __nv_bfloat162 h = __floats2bfloat162_rn(x[0], x[1]);
+    memcpy(&v, &h, sizeof v);
+#endif
+    return v;
+}
+// x rounded to bf16 and back, a pair at a time
+__device__ __forceinline__ void round_bf2(float& a, float& b) {
+#if CCK_AMD
+    a = from_bf(to_bf(a)), b = from_bf(to_bf(b));
+#else
+    const __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
+    a = __low2float(h), b = __high2float(h);
+#endif
+}
+
 __device__ __forceinline__ void acc_zero(Acc& a) {
 #pragma unroll
     for (int i = 0; i < kAccVals; i++) {

@@ -169,12 +169,12 @@ __device__ __forceinline__ void acc_store_bf(const Acc (&x)[kChanT], bf16* p, in
     for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
         for (int i = 0; i < kAccVals; i += kAdj) {
-            Adj<bf16> v;
+            float y[kAdj];
 #pragma unroll
             for (int j = 0; j < kAdj; j++) {
-                v.v[j] = bf16(to_bf(x[nt].v[i + j]));
+                y[j] = x[nt].v[i + j];
             }
-            adj(p + acc_row(i) * ld + col0 + nt * kMma + acc_col(i)) = v;
+            adj(p + acc_row(i) * ld + col0 + nt * kMma + acc_col(i)) = adj_bf(y);
         }
     }
 }
@@ -350,8 +350,9 @@ __device__ __noinline__ void atom_proj_item(const AtomW& w, int b, int row0, int
 #pragma unroll
             for (int nt = 0; nt < kChanT; nt++) {
 #pragma unroll
-                for (int i = 0; i < kAccVals; i++) {
-                    x[nt].v[i] = from_bf(to_bf(y[nt].v[i])); // bf16(xq), as aq holds it
+                for (int i = 0; i < kAccVals; i += 2) {
+                    x[nt].v[i] = y[nt].v[i], x[nt].v[i + 1] = y[nt].v[i + 1];
+                    round_bf2(x[nt].v[i], x[nt].v[i + 1]); // bf16(xq), as aq holds it
                 }
             }
             acc_norm(x, esm, c_kp.atom_eps);

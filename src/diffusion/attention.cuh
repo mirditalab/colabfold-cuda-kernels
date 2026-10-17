@@ -74,12 +74,12 @@ __device__ __forceinline__ void store_gated(const Acc& o, const float (&l)[kRowS
         if (r < rows_left) {
             const Adj<bf16> g = adj(gate + size_t(r) * ldg + c);
             const float inv = 1.f / l[row_slot(i)];
-            Adj<bf16> v;
+            float y[kAdj];
 #pragma unroll
             for (int j = 0; j < kAdj; j++) {
-                v.v[j] = bf16(to_bf(o.v[i + j] * inv * from_bf(g.v[j])));
+                y[j] = o.v[i + j] * inv * from_bf(g.v[j]);
             }
-            adj(out + size_t(r) * ldo + c) = v;
+            adj(out + size_t(r) * ldo + c) = adj_bf(y);
         }
     }
 }
